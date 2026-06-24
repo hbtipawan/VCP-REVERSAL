@@ -18,11 +18,56 @@ import numpy as np, pandas as pd
 
 SCRIP_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 HIST_URL  = "https://api.dhan.co/v2/charts/historical"
+AUTH_URL  = "https://auth.dhan.co/app/generateAccessToken"   # headless TOTP token gen
+PROFILE_URL = "https://api.dhan.co/v2/profile"               # token + Data-API status
 UA = "Mozilla/5.0 (compatible; screener/1.0)"
 
 # Nifty 50 index (for relative-strength benchmark) on Dhan
 NIFTY_ROW = {"symbol": "NIFTY 50", "name": "Nifty 50", "exch": "NSE",
              "security_id": "13", "exchange_segment": "IDX_I", "instrument": "INDEX"}
+
+# ----------------------------------------------------- auth / profile ----
+def generate_token(client_id, pin, totp_secret, timeout=20):
+    """Headless 24h access-token via TOTP. Requires TOTP enabled on the Dhan account.
+    Computes the live 6-digit code from totp_secret, calls Dhan's generateAccessToken.
+    NOTE: each successful call invalidates your previous token (call once/day)."""
+    try:
+        import pyotp
+    except ImportError as e:
+        raise RuntimeError("pyotp is not installed (add 'pyotp' to requirements.txt).") from e
+    code = pyotp.TOTP(str(totp_secret).strip().replace(" ", "")).now()
+    url = (f"{AUTH_URL}?dhanClientId={str(client_id).strip()}"
+           f"&pin={str(pin).strip()}&totp={code}")
+    req = urllib.request.Request(url, data=b"", method="POST",
+                                 headers={"Accept": "application/json", "User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.load(r)
+    except urllib.error.HTTPError as e:
+        try: msg = json.load(e).get("message") or json.load(e).get("errorMessage")
+        except Exception: msg = f"HTTP {e.code}"
+        raise PermissionError(f"Dhan token generation failed: {msg}. Check Client ID, PIN, "
+                              f"and that TOTP is enabled with the correct secret.") from e
+    tok = d.get("accessToken") or d.get("access_token")
+    if not tok:
+        raise PermissionError(f"Dhan token generation failed: {d.get('message') or d}. "
+                              f"Ensure TOTP is enabled and Client ID/PIN/secret are correct.")
+    return tok, d.get("expiryTime") or d.get("expiry_time")
+
+def get_profile(token, client_id=None, timeout=20):
+    """GET /v2/profile -> dict with tokenValidity, dataPlan (Data-API status), dataValidity,
+    activeSegment, etc. Used to diagnose auth/subscription problems."""
+    headers = {"Accept": "application/json", "access-token": token or "", "User-Agent": UA}
+    if client_id: headers["client-id"] = str(client_id)
+    req = urllib.request.Request(PROFILE_URL, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try: return json.load(e)
+        except Exception: return {"errorMessage": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"errorMessage": str(e)}
 
 # --------------------------------------------------------- scrip master ----
 def load_scrip_master(url=SCRIP_URL):

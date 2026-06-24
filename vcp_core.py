@@ -51,7 +51,7 @@ def _funnel(A, end, F, c):
         return (np.nanmax(A['h'][a:b+1])-np.nanmin(A['l'][a:b+1]))/c
     return rp(end-F+1,end-2*w), rp(end-2*w+1,end-w), rp(end-w+1,end)
 
-def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.25, max_tight=0.05,
+def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
                 min_base=3, strictness="Strict", nifty_mom_ret=0.0):
     p=tf_params(timeframe); A=vcp_arrays(df,p); n=A['n']
     if n < max(p['mal'], p['win'])+5: return None
@@ -92,19 +92,23 @@ def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.25, max_tight=0.05,
         status,base="Coiling",co
     else:                                                   # breakout: base ended yesterday, clears pivot on volume
         bo=assess(i-1)
-        if bo and c>bo['piv'] and vol_surge>=1.5:
+        if bo and c>bo['piv'] and vol_surge>=2.5:           # 2.5x+ surge (backtest: 2.5-4x best)
             status,base="Breakout",bo
     if base is None: return None
     mom=p['mom']; sret=(c/A['c'][i-mom]-1) if i-mom>=0 and A['c'][i-mom]>0 else 0.0
     rs=sret-(nifty_mom_ret or 0.0)
-    s_tight=22*max(0,1-base['tight']/max_tight)
-    s_contr=20*float(np.clip(1-base['contr'],0,1))
-    s_dry  =18*float(np.clip((1-base['dry'])/0.5,0,1))
-    s_near =12*max(0,1-nh/near_high_pct)
-    s_base =10*float(np.clip((base['bk']-min_base)/8,0,1))
-    s_rs   =10*float(np.clip(0.5+rs/0.4,0,1))
-    s_trend=8
-    score=round(s_tight+s_contr+s_dry+s_near+s_base+s_rs+s_trend)
+    # weights re-tuned from a 2,072-trade breakout backtest: proximity to 52w high,
+    # relative strength, and a 2.5-4x breakout surge were the strongest return drivers.
+    s_tight=14*max(0,1-base['tight']/max_tight)
+    s_contr=12*float(np.clip(1-base['contr'],0,1))
+    s_dry  =10*float(np.clip((1-base['dry'])/0.5,0,1))
+    s_near =18*max(0,1-nh/near_high_pct)
+    s_base = 8*float(np.clip((base['bk']-min_base)/8,0,1))
+    s_rs   =18*float(np.clip(0.5+rs/0.5,0,1))
+    s_surge=10*(1.0 if 2.5<=vol_surge<=4.0 else (0.5 if vol_surge>1.5 else 0.0)) if status=="Breakout" \
+            else 10*float(np.clip((1-base['dry'])/0.5,0,1))   # coiling: reward quiet base instead
+    s_trend=10
+    score=round(s_tight+s_contr+s_dry+s_near+s_base+s_rs+s_surge+s_trend)
     grade="A" if score>=75 else "B" if score>=60 else "C"
     return dict(symbol=row['symbol'], name=row.get('name',''), exch=row.get('exch',''),
         sector=row.get('sector',''), close=round(c,2), status=status, grade=grade, score=score,
@@ -182,7 +186,7 @@ cleared the pivot on a volume surge (TARIL-type). Tight = base span %; Dry = bas
 Pivot, stop at base low. Grade reflects base quality. Research tool, not investment advice.</div>
 </div></body></html>"""
 
-def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.25,
+def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
                    max_tight=0.05, min_base=3, strictness="Strict", max_workers=8,
                    progress=None, request_delay=0.0, nifty_ret=0.0):
     fetch_fn = fetch_fn or (lambda row: sc.fetch_ohlcv(row["yahoo"]))

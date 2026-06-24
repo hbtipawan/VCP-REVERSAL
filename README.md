@@ -14,14 +14,19 @@ Exchange, Timeframe (Daily/Weekly), sector filter, and scan-all controls.
 ## Repo layout (put all of these in the GitHub repo root)
 
 ```
-streamlit_app.py              # the Streamlit UI (both scanners, Dhan/Yahoo)
+streamlit_app.py              # the Streamlit UI (both scanners, Upstox/Dhan/Yahoo)
 screener_core.py              # reversal-pattern engine
-vcp_core.py                   # VCP engine
-dhan_data.py                  # DhanHQ v2 data layer (scrip-master + historical fetch)
+vcp_core.py                   # VCP engine (backtest-tuned)
+upstox_data.py                # Upstox data layer (free, no token) — recommended
+dhan_data.py                  # Dhan data layer (paid Data API + token/TOTP)
 bullish_reversal_screener.py  # optional command-line reversal runner
 requirements.txt
 EQUITY_L_2.csv                # NSE list  (cols: companyId, Name, Sector, Industry)
 bse_stocks.csv                # BSE list  (cols: Scrip Code, Scrip ID, Scrip Name, Status, ...)
+
+# analysis (not needed to run the app):
+vcp_backtest.py               # the breakout backtest harness
+VCP_BACKTEST_FINDINGS.md      # results + recommended settings
 ```
 
 > The two CSV filenames are referenced at the top of `streamlit_app.py`
@@ -42,36 +47,24 @@ streamlit run streamlit_app.py
 
 That's it — `requirements.txt` is picked up automatically.
 
-## Data source: Dhan (default) or Yahoo
+## Data source: Upstox (recommended), Dhan, or Yahoo
 
 Pick the source with the **Data source** toggle in the sidebar.
 
-**Dhan (default).** Uses the DhanHQ v2 historical API (`/v2/charts/historical`). Dhan
-identifies stocks by numeric **security IDs**, so the app downloads Dhan's public
-scrip-master once (cached for a day) and maps your NSE/BSE symbols automatically
-(~99% of your lists map; anything Dhan doesn't list is skipped and counted).
+**Upstox (default, recommended).** Upstox's historical-candle API is **free, needs no token,
+no login, and no subscription**, and it's exchange-grade (adjusted for splits/bonuses). The
+app downloads Upstox's public instrument list once (cached for a day) and maps your NSE/BSE
+symbols automatically. Nothing to configure — just run.
 
-You need a Dhan **access-token** (JWT) from an account with an **active Data API
-subscription** (the data/historical endpoints are a paid add-on; order/portfolio APIs
-are free). Provide it either way:
+**Dhan.** Accurate, but historical data needs a paid **Data API subscription** (₹499 + tax/
+month, or free if you've done 25+ trades in the last 30 days) **and** a 24-hour access token.
+Use the **"Check Dhan connection"** button to see whether your token is valid and your Data
+API plan is active. Two login modes: *Paste token* (24h JWT, or set `DHAN_ACCESS_TOKEN` in
+secrets), or *Auto-login (TOTP)* — set `DHAN_CLIENT_ID`, `DHAN_PIN`, `DHAN_TOTP_SECRET` in
+secrets (TOTP must be enabled on your Dhan account) and the app mints a fresh token daily.
 
-- **Recommended — Streamlit secrets.** In your app's *Settings → Secrets*, add:
-  ```
-  DHAN_ACCESS_TOKEN = "your_jwt_here"
-  DHAN_CLIENT_ID = "your_client_id"   # optional
-  ```
-  The app picks these up automatically and never shows the token on screen.
-- **Or paste it** into the sidebar's *Dhan access-token* box (kept only for the session).
-
-Daily candles come straight from Dhan; **weekly** is resampled from daily (the Dhan
-historical endpoint returns daily bars). Dhan rate-limits the data API, so keep
-**Fetch threads** modest (default 5) — large scans auto-throttle and cache for the
-day, so the first full-universe scan takes several minutes and re-runs are instant.
-If every stock returns "no data," your token is wrong/expired or the Data API
-subscription isn't active (the app says so).
-
-**Yahoo (fallback).** No token needed — handy if your Dhan subscription isn't set up.
-Same engines, same output.
+**Yahoo.** Free, no token, but less accurate for Indian stocks (misses some corporate-action
+adjustments).
 
 ## CLI data source
 

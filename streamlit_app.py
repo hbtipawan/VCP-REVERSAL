@@ -19,6 +19,7 @@ import streamlit as st
 import screener_core as sc
 import vcp_core as vc
 import dhan_data as dd
+import upstox_data as ud
 
 st.set_page_config(page_title="Bullish Scanners", layout="wide", page_icon=":chart_with_upwards_trend:")
 NSE_CSV = "EQUITY_L_2.csv"
@@ -95,6 +96,17 @@ def get_list(kind):
 def dhan_maps():
     return dd.build_symbol_maps(dd.load_scrip_master())
 
+@st.cache_data(show_spinner="Loading Upstox instruments...", ttl=24*3600)
+def upstox_maps():
+    return ud.build_symbol_maps()
+
+@st.cache_data(show_spinner="Generating Dhan access token...", ttl=23*3600)
+def get_dhan_auto_token(client_id, pin, totp_secret, daystamp):
+    """Generate (and cache for the day) a fresh 24h token via TOTP. daystamp forces
+    one regeneration per day. Returns the token string; raises on failure."""
+    tok, _exp = dd.generate_token(client_id, pin, totp_secret)
+    return tok
+
 # --------------------------- persistent, thread-safe fetch cache --------------------
 @st.cache_resource
 def _fetch_cache():
@@ -103,7 +115,9 @@ def _fetch_cache():
 def make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, token, client, daystamp):
     cache, lock = _fetch_cache()
     def f(row):
-        rid = row.get("security_id") if source == "Dhan" else row.get("yahoo")
+        rid = (row.get("security_id") if source == "Dhan"
+               else row.get("instrument_key") if source == "Upstox"
+               else row.get("yahoo"))
         key = (source, rid, weekly, daystamp)
         with lock:
             if key in cache: return cache[key]
@@ -113,6 +127,10 @@ def make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, token, client, 
                                 row.get("instrument","EQUITY"), from_d.isoformat(),
                                 to_d.isoformat(), token, client)
             if df is not None and weekly: df = dd.to_weekly(df)
+        elif source == "Upstox":
+            to_d = dt.date.today(); from_d = to_d - dt.timedelta(days=int(years*365)+15)
+            df = ud.fetch_daily(row["instrument_key"], from_d.isoformat(), to_d.isoformat())
+            if df is not None and weekly: df = ud.to_weekly(df)
         else:
             df = sc.fetch_ohlcv(row["yahoo"], rng=yahoo_rng, interval=yahoo_interval)
         with lock: cache[key] = df
@@ -155,19 +173,45 @@ def vcp_table(rows):
 # =================================== SIDEBAR ========================================
 st.sidebar.title("Scanner")
 scanner = st.sidebar.radio("Mode", ["Reversal patterns", "VCP breakout"], index=0)
-source = st.sidebar.radio("Data source", ["Dhan", "Yahoo"], index=0,
-            help="Dhan = DhanHQ v2 historical API (needs access-token + Data API subscription). "
-                 "Yahoo = no token needed (fallback).")
+source = st.sidebar.radio("Data source", ["Upstox", "Dhan", "Yahoo"], index=0,
+            help="Upstox = free, accurate, no token or login needed (recommended). "
+                 "Dhan = needs access-token + paid Data API subscription. "
+                 "Yahoo = free but less accurate for Indian stocks.")
 dhan_token = dhan_client = None
+dhan_auth_err = None
 if source == "Dhan":
-    dhan_token = get_secret("DHAN_ACCESS_TOKEN", "")
     dhan_client = get_secret("DHAN_CLIENT_ID", "")
-    if not dhan_token:
-        dhan_token = st.sidebar.text_input("Dhan access-token", type="password",
-            help="JWT from your Dhan account (Data API subscription required). "
-                 "Better: store it as DHAN_ACCESS_TOKEN in Streamlit secrets.")
+    sec_token = get_secret("DHAN_ACCESS_TOKEN", "")
+    sec_pin = get_secret("DHAN_PIN", ""); sec_totp = get_secret("DHAN_TOTP_SECRET", "")
+    # auth mode: auto-TOTP if a totp secret is configured, else manual token
+    default_mode = "Auto-login (TOTP)" if (sec_totp and dhan_client) else "Paste token"
+    auth_mode = st.sidebar.radio("Dhan login", ["Paste token", "Auto-login (TOTP)"],
+                    index=0 if default_mode == "Paste token" else 1,
+                    help="Auto-login generates a fresh 24h token each day from your Client ID + PIN "
+                         "+ TOTP secret, so you never paste a token. Requires TOTP enabled on Dhan.")
+    if auth_mode == "Paste token":
+        dhan_token = sec_token
+        if not dhan_token:
+            dhan_token = st.sidebar.text_input("Dhan access-token", type="password",
+                help="24h JWT from web.dhan.co. Better: store as DHAN_ACCESS_TOKEN in secrets.")
+        elif sec_token:
+            st.sidebar.caption("Using token from secrets.")
     else:
-        st.sidebar.caption("Using Dhan token from secrets.")
+        cid = dhan_client or st.sidebar.text_input("Dhan Client ID", value="")
+        pin = sec_pin or st.sidebar.text_input("Dhan PIN", type="password")
+        totp_secret = sec_totp or st.sidebar.text_input("TOTP secret", type="password",
+                        help="The text string shown under the QR code at "
+                             "My Profile -> Access DhanHQ APIs -> Setup TOTP.")
+        if cid and pin and totp_secret:
+            try:
+                dhan_token = get_dhan_auto_token(cid, pin, totp_secret, str(dt.date.today()))
+                dhan_client = cid
+                st.sidebar.caption("Auto-login token ready (refreshes daily).")
+            except Exception as e:
+                dhan_auth_err = str(e)
+                st.sidebar.error("Auto-login failed — see message in main panel.")
+        else:
+            st.sidebar.caption("Enter Client ID, PIN and TOTP secret (or set them in secrets).")
 exch = st.sidebar.radio("Exchange", ["NSE", "BSE", "Both"], index=0)
 timeframe = st.sidebar.radio("Timeframe", ["Daily", "Weekly"], index=0)
 
@@ -192,6 +236,7 @@ uni = uni.drop_duplicates(subset=["symbol", "exch"]).reset_index(drop=True)
 
 # Map symbols -> Dhan security IDs (drops anything Dhan doesn't list)
 unmapped = []
+unmapped = []
 if source == "Dhan":
     try:
         nse_map, bse_map = dhan_maps()
@@ -200,6 +245,14 @@ if source == "Dhan":
         st.title("Bullish Scanners")
         st.error(f"Could not load the Dhan instrument master: {e}")
         st.stop()
+elif source == "Upstox":
+    try:
+        nse_map, bse_map = upstox_maps()
+        uni, unmapped = ud.map_universe(uni, nse_map, bse_map)
+    except Exception as e:
+        st.title("Bullish Scanners")
+        st.error(f"Could not load Upstox instruments: {e}")
+        st.stop()
 
 sectors = sorted(s for s in uni["sector"].dropna().unique() if s and s != "nan")
 chosen = st.sidebar.multiselect("Sectors / industries (optional)", sectors)
@@ -207,7 +260,7 @@ if chosen:
     uni = uni[uni["sector"].isin(chosen)]
 
 st.sidebar.markdown(f"**{len(uni)}** stocks match"
-                    + (f" ({len(unmapped)} not on Dhan, skipped)" if source == "Dhan" and unmapped else ""))
+                    + (f" ({len(unmapped)} not listed, skipped)" if source in ("Dhan","Upstox") and unmapped else ""))
 total_uni = len(uni)
 scan_all = st.sidebar.checkbox("Scan ALL matching stocks (no limit)", value=False,
             help="Scans every matching stock. Large scans auto-throttle and cache for the day.")
@@ -225,7 +278,7 @@ if scanner == "Reversal patterns":
     vol_only = st.sidebar.checkbox("Show volume-confirmed signals only", value=False)
 else:
     st.sidebar.markdown("**VCP settings**")
-    near_high = st.sidebar.slider("Within % of 52-period high", 10, 40, 25)
+    near_high = st.sidebar.slider("Within % of 52-period high", 5, 40, 12)
     max_tight = st.sidebar.slider("Max base tightness (%)", 2, 10, 5)
     min_base  = st.sidebar.slider("Min base length (bars)", 3, 15, 3)
     strictness = st.sidebar.selectbox("Trend strictness", ["Strict", "Standard", "Relaxed"], index=0)
@@ -251,8 +304,39 @@ else:
     st.markdown("High-grade volatility-contraction bases near the highs (Minervini-style). "
                 "**Coiling** = tight base under the pivot; **Breakout** = today cleared the pivot on a "
                 "volume surge. Strict by design.")
-st.caption(f"Data source: **{source}**" + ("  ·  Dhan historical API (Data API subscription required)"
-           if source == "Dhan" else "  ·  Yahoo Finance"))
+st.caption(f"Data source: **{source}**" + {
+    "Dhan": "  ·  Dhan historical API (Data API subscription required)",
+    "Upstox": "  ·  Upstox historical API (free, no token or login needed)",
+    "Yahoo": "  ·  Yahoo Finance",
+}.get(source, ""))
+
+if source == "Dhan":
+    if dhan_auth_err:
+        st.error(f"Auto-login error: {dhan_auth_err}")
+    cc1, cc2 = st.columns([1, 3])
+    if cc1.button("Check Dhan connection", use_container_width=True):
+        if not dhan_token:
+            st.warning("No token yet — paste a token or set up auto-login in the sidebar first.")
+        else:
+            prof = dd.get_profile(dhan_token, dhan_client)
+            if prof.get("errorCode") or prof.get("errorType"):
+                st.error(f"Token rejected: {prof.get('errorMessage', prof)}. The token is invalid or "
+                         "expired — regenerate it (tokens last 24h) or fix your credentials.")
+            else:
+                data_ok = str(prof.get("dataPlan", "")).lower() == "active"
+                st.success(f"Token valid for client {prof.get('dhanClientId','?')} "
+                           f"(expires {prof.get('tokenValidity','?')}).")
+                cols = st.columns(3)
+                cols[0].metric("Data API plan", prof.get("dataPlan", "—"))
+                cols[1].metric("Data valid till", str(prof.get("dataValidity", "—"))[:10])
+                cols[2].metric("Segments", "✓" if prof.get("activeSegment") else "—")
+                if not data_ok:
+                    st.error("Your **Data API plan is not Active** — that's why historical data fails. "
+                             "Historical/EOD data needs the Data API subscription (₹499 + tax/month, or "
+                             "free if you've done 25+ trades in the last 30 days). Activate it at "
+                             "web.dhan.co → My Profile → Access DhanHQ APIs → **Data APIs** tab, then retry.")
+                else:
+                    st.info("Data API is active — you're good to run the scan.")
 
 # =================================== RUN ============================================
 if run:
@@ -294,7 +378,8 @@ if run:
         years = 3.5 if weekly else 2.2
         yahoo_rng = vc.tf_params(timeframe)["rng"]
         fetch_fn = make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, dhan_token, dhan_client, daystamp)
-        nrow = dd.NIFTY_ROW if source == "Dhan" else {"yahoo": "^NSEI", "symbol": "NIFTY", "exch": "NSE"}
+        nrow = (dd.NIFTY_ROW if source == "Dhan" else ud.NIFTY_ROW if source == "Upstox"
+                else {"yahoo": "^NSEI", "symbol": "NIFTY", "exch": "NSE"})
         nret = vc.nifty_mom(timeframe, fetch_fn=fetch_fn, nifty_row=nrow)
         with st.spinner(f"Scanning {n_scan} stocks for VCP bases ({timeframe.lower()})..."):
             try:
