@@ -341,6 +341,9 @@ def build_html(results, scanned, failed, scan_last_n=1, title="Bullish Reversal 
                f'<span class="cnt">{cnt}</span></button>')
         if rows:
             trs=""
+            def _mc(v):
+                if v is None: return "&mdash;"
+                return f"{v/1e5:.2f}L Cr" if v>=1e5 else (f"{v:,.0f} Cr" if v>=1000 else f"{v:,.1f} Cr")
             for r in rows:
                 badge=('<span class="vok">check vol</span>' if r['vol_confirmed'] else '<span class="vno">-</span>')
                 ago="today" if r['bars_ago']==0 else f"{r['bars_ago']}{unit} ago"
@@ -349,9 +352,9 @@ def build_html(results, scanned, failed, scan_last_n=1, title="Bullish Reversal 
                       f"target='_blank' rel='noopener'>{r['symbol']}</a><span class='ex'>{r['exch']}</span></td>"
                       f"<td>{r['close']}</td><td>{r['date']}<span class='ago'>{ago}</span></td>"
                       f"<td>{vr} {badge}</td><td>{r['stop']}</td><td>{r['risk']}%</td>"
-                      f"<td>{r['target']}</td><td class='note'>{r['note']}</td></tr>")
+                      f"<td>{r['target']}</td><td>{_mc(r.get('mcap_cr'))}</td><td class='note'>{r['note']}</td></tr>")
             body=(f"<table><tr><th>Symbol</th><th>Close</th><th>Signal</th><th>Vol vs avg</th>"
-                  f"<th>Stop</th><th>Risk</th><th>2R target</th><th>Read</th></tr>{trs}</table>")
+                  f"<th>Stop</th><th>Risk</th><th>2R target</th><th>Mkt Cap</th><th>Read</th></tr>{trs}</table>")
         else:
             body="<div class='empty'>No fresh signals in this category.</div>"
         panes+=(f'<div class="pane {active}" id="pane{idx}"><div class="phead"><h2>{name}</h2>'

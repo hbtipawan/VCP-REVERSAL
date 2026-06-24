@@ -20,6 +20,7 @@ import screener_core as sc
 import vcp_core as vc
 import dhan_data as dd
 import upstox_data as ud
+import marketcap as mcap
 
 st.set_page_config(page_title="Bullish Scanners", layout="wide", page_icon=":chart_with_upwards_trend:")
 NSE_CSV = "EQUITY_L_2.csv"
@@ -100,6 +101,10 @@ def dhan_maps():
 def upstox_maps():
     return ud.build_symbol_maps()
 
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def market_caps(pairs, daystamp):
+    return mcap.get_marketcaps([tuple(p) for p in pairs])
+
 @st.cache_data(show_spinner="Generating Dhan access token...", ttl=23*3600)
 def get_dhan_auto_token(client_id, pin, totp_secret, daystamp):
     """Generate (and cache for the day) a fresh 24h token via TOTP. daystamp forces
@@ -148,9 +153,10 @@ def reversal_table(rows, unit="d"):
                 f"rel='noopener'>{r['symbol']}</a><span class='ex'>{r['exch']}</span></td>"
                 f"<td>{r['close']}</td><td>{r['date']}<br><span class='ago'>{ago}</span></td>"
                 f"<td>{vr} {badge}</td><td>{r['stop']}</td><td>{r['risk']}%</td>"
-                f"<td>{r['target']}</td><td class='nm'>{r['name']}</td><td class='note'>{r['note']}</td></tr>")
+                f"<td>{r['target']}</td><td>{mcap.fmt_cr(r.get('mcap_cr'))}</td>"
+                f"<td class='nm'>{r['name']}</td><td class='note'>{r['note']}</td></tr>")
     return ("<table class='res'><tr><th>Symbol</th><th>Close</th><th>Signal</th><th>Vol vs avg</th>"
-            "<th>Stop</th><th>Risk</th><th>2R target</th><th>Company</th><th>Read</th></tr>" + trs + "</table>")
+            "<th>Stop</th><th>Risk</th><th>2R target</th><th>Mkt Cap</th><th>Company</th><th>Read</th></tr>" + trs + "</table>")
 
 def vcp_table(rows):
     gcol = {"A": "#1b7a2f", "B": "#0d47a1", "C": "#8a6d00"}
@@ -165,10 +171,11 @@ def vcp_table(rows):
                 f"<td>{r['close']}</td><td>{r['tightness']}%</td><td>{r['base_len']}</td>"
                 f"<td>{r['contraction']}</td><td>{r['dryup']}</td><td>{r['near_high']}%</td>"
                 f"<td>{r['rs']}%</td><td>{r['pivot']}</td><td>{r['dist_pivot']}%</td>"
-                f"<td>{r['vol_surge']}x</td><td>{r['stop']}</td><td>{r['target']}</td><td class='nm'>{r['name']}</td></tr>")
+                f"<td>{r['vol_surge']}x</td><td>{r['stop']}</td><td>{r['target']}</td>"
+                f"<td>{mcap.fmt_cr(r.get('mcap_cr'))}</td><td class='nm'>{r['name']}</td></tr>")
     return ("<table class='res'><tr><th>Grade</th><th>Status</th><th>Symbol</th><th>Close</th><th>Tight</th>"
             "<th>Base</th><th>Contr</th><th>Dry</th><th>Near hi</th><th>RS</th><th>Pivot</th><th>To pivot</th>"
-            "<th>Vol</th><th>Stop</th><th>2R tgt</th><th>Company</th></tr>" + trs + "</table>")
+            "<th>Vol</th><th>Stop</th><th>2R tgt</th><th>Mkt Cap</th><th>Company</th></tr>" + trs + "</table>")
 
 # =================================== SIDEBAR ========================================
 st.sidebar.title("Scanner")
@@ -215,52 +222,67 @@ if source == "Dhan":
 exch = st.sidebar.radio("Exchange", ["NSE", "BSE", "Both"], index=0)
 timeframe = st.sidebar.radio("Timeframe", ["Daily", "Weekly"], index=0)
 
-frames = []
-if exch in ("NSE", "Both"):
-    nse = get_list("NSE")
-    if nse is not None: frames.append(nse)
-if exch in ("BSE", "Both"):
-    bse = get_list("BSE")
-    if bse is not None: frames.append(bse)
-if not frames:
-    st.title("Bullish Scanners")
-    st.warning("Stock-list CSV(s) not found. Place **EQUITY_L_2.csv** (NSE) and/or "
-               "**bse_stocks.csv** (BSE) next to this app, or upload them in the sidebar.")
-    st.stop()
+full_universe = st.sidebar.checkbox("Scan entire NSE/BSE universe (ignore my list)", value=False,
+                    help="Screens every cash-equity on the selected exchange(s) straight from the "
+                         "data source, instead of your uploaded CSVs.")
 
-uni = pd.concat(frames, ignore_index=True)
+unmapped = []
+cap_note = None
+if full_universe:
+    try:
+        if source == "Dhan":
+            uni = dd.full_universe(exch, dd.load_scrip_master())
+        elif source == "Upstox":
+            uni = ud.full_universe(exch)
+        else:                                    # Yahoo: use Upstox's symbol list
+            uni = ud.full_universe(exch)
+    except Exception as e:
+        st.title("Bullish Scanners"); st.error(f"Could not load the full universe: {e}"); st.stop()
+    if "yahoo" not in uni.columns:
+        uni["yahoo"] = uni.apply(lambda r: r["symbol"] + (".NS" if r["exch"] == "NSE" else ".BO"), axis=1)
+    cap_note = f"full {exch} universe"
+else:
+    frames = []
+    if exch in ("NSE", "Both"):
+        nse = get_list("NSE")
+        if nse is not None: frames.append(nse)
+    if exch in ("BSE", "Both"):
+        bse = get_list("BSE")
+        if bse is not None: frames.append(bse)
+    if not frames:
+        st.title("Bullish Scanners")
+        st.warning("Stock-list CSV(s) not found. Place **EQUITY_L_2.csv** (NSE) and/or "
+                   "**bse_stocks.csv** (BSE) next to this app, or upload them in the sidebar.")
+        st.stop()
+    uni = pd.concat(frames, ignore_index=True)
+    # Map symbols -> source IDs (drops anything the source doesn't list)
+    if source == "Dhan":
+        try:
+            nse_map, bse_map = dhan_maps()
+            uni, unmapped = dd.map_universe(uni, nse_map, bse_map)
+        except Exception as e:
+            st.title("Bullish Scanners"); st.error(f"Could not load the Dhan instrument master: {e}"); st.stop()
+    elif source == "Upstox":
+        try:
+            nse_map, bse_map = upstox_maps()
+            uni, unmapped = ud.map_universe(uni, nse_map, bse_map)
+        except Exception as e:
+            st.title("Bullish Scanners"); st.error(f"Could not load Upstox instruments: {e}"); st.stop()
+
 if exch == "Both":
     nse_syms = set(uni[uni["exch"] == "NSE"]["symbol"].str.upper())
     uni = uni[~((uni["exch"] == "BSE") & (uni["symbol"].str.upper().isin(nse_syms)))]
 uni = uni.drop_duplicates(subset=["symbol", "exch"]).reset_index(drop=True)
 
-# Map symbols -> Dhan security IDs (drops anything Dhan doesn't list)
-unmapped = []
-unmapped = []
-if source == "Dhan":
-    try:
-        nse_map, bse_map = dhan_maps()
-        uni, unmapped = dd.map_universe(uni, nse_map, bse_map)
-    except Exception as e:
-        st.title("Bullish Scanners")
-        st.error(f"Could not load the Dhan instrument master: {e}")
-        st.stop()
-elif source == "Upstox":
-    try:
-        nse_map, bse_map = upstox_maps()
-        uni, unmapped = ud.map_universe(uni, nse_map, bse_map)
-    except Exception as e:
-        st.title("Bullish Scanners")
-        st.error(f"Could not load Upstox instruments: {e}")
-        st.stop()
-
 sectors = sorted(s for s in uni["sector"].dropna().unique() if s and s != "nan")
-chosen = st.sidebar.multiselect("Sectors / industries (optional)", sectors)
-if chosen:
-    uni = uni[uni["sector"].isin(chosen)]
+if sectors:
+    chosen = st.sidebar.multiselect("Sectors / industries (optional)", sectors)
+    if chosen:
+        uni = uni[uni["sector"].isin(chosen)]
 
-st.sidebar.markdown(f"**{len(uni)}** stocks match"
-                    + (f" ({len(unmapped)} not listed, skipped)" if source in ("Dhan","Upstox") and unmapped else ""))
+st.sidebar.markdown(f"**{len(uni)}** stocks "
+                    + ("in the full universe" if full_universe else "match")
+                    + (f" ({len(unmapped)} not listed, skipped)" if (not full_universe and source in ("Dhan","Upstox") and unmapped) else ""))
 total_uni = len(uni)
 scan_all = st.sidebar.checkbox("Scan ALL matching stocks (no limit)", value=False,
             help="Scans every matching stock. Large scans auto-throttle and cache for the day.")
@@ -399,6 +421,10 @@ R = st.session_state.get("res")
 if R and R["mode"] == "reversal" and scanner == "Reversal patterns":
     results, scanned, failed = R["results"], R["scanned"], R["failed"]
     tf = R.get("timeframe", "Daily"); unit = "w" if tf == "Weekly" else "d"
+    _allrows = [r for nm in sc.PATTERN_NAMES for r in results[nm]]
+    if _allrows and not _allrows[0].get("mcap_done"):
+        _caps = market_caps([(r["symbol"], r["exch"]) for r in _allrows], str(dt.date.today()))
+        for r in _allrows: r["mcap_cr"] = _caps.get((r["symbol"], r["exch"])); r["mcap_done"] = True
     disp = {n: [r for r in results[n] if (r["vol_confirmed"] or not vol_only)] for n in sc.PATTERN_NAMES}
     total = sum(len(v) for v in disp.values())
     c1, c2, c3, c4 = st.columns(4)
@@ -429,6 +455,9 @@ if R and R["mode"] == "reversal" and scanner == "Reversal patterns":
 
 elif R and R["mode"] == "vcp" and scanner == "VCP breakout":
     cands, scanned, failed = R["cands"], R["scanned"], R["failed"]
+    if cands and not cands[0].get("mcap_done"):
+        _caps = market_caps([(r["symbol"], r["exch"]) for r in cands], str(dt.date.today()))
+        for r in cands: r["mcap_cr"] = _caps.get((r["symbol"], r["exch"])); r["mcap_done"] = True
     tf = R.get("timeframe", "Daily")
     allow = {"A only": {"A"}, "A & B": {"A", "B"}, "All (A/B/C)": {"A", "B", "C"}}[min_grade]
     disp = [r for r in cands if r["grade"] in allow and (status_f == "All" or r["status"] == status_f)]

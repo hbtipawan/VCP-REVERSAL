@@ -141,6 +141,9 @@ def build_vcp_html(rows, scanned, failed, timeframe="Daily", summary=""):
     from datetime import datetime
     today=datetime.now().strftime("%d %b %Y %H:%M")
     gcol={"A":"#1b7a2f","B":"#0d47a1","C":"#8a6d00"}
+    def _mc(v):
+        if v is None: return "&mdash;"
+        return f"{v/1e5:.2f}L Cr" if v>=1e5 else (f"{v:,.0f} Cr" if v>=1000 else f"{v:,.1f} Cr")
     trs=""
     for r in rows:
         g=r['grade']; st_="Breakout" if r['status']=="Breakout" else "Coiling"
@@ -153,10 +156,10 @@ def build_vcp_html(rows, scanned, failed, timeframe="Daily", summary=""):
               f"<td>{r['contraction']}</td><td>{r['dryup']}</td><td>{r['near_high']}%</td>"
               f"<td>{r['rs']}%</td><td>{r['pivot']}</td><td>{r['dist_pivot']}%</td>"
               f"<td>{r['vol_surge']}x</td><td>{r['stop']}</td><td>{r['target']}</td>"
-              f"<td class='nm'>{r['name']}</td></tr>")
+              f"<td>{_mc(r.get('mcap_cr'))}</td><td class='nm'>{r['name']}</td></tr>")
     body=(f"<table><tr><th>Grade</th><th>Status</th><th>Symbol</th><th>Close</th><th>Tight</th>"
           f"<th>Base</th><th>Contr</th><th>Dry</th><th>Near hi</th><th>RS</th><th>Pivot</th>"
-          f"<th>To pivot</th><th>Vol</th><th>Stop</th><th>2R tgt</th><th>Company</th></tr>{trs}</table>"
+          f"<th>To pivot</th><th>Vol</th><th>Stop</th><th>2R tgt</th><th>Mkt Cap</th><th>Company</th></tr>{trs}</table>"
           if rows else "<div class='empty'>No VCP candidates matched.</div>")
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>VCP Scanner</title><style>

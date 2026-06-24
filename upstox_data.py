@@ -67,6 +67,32 @@ def map_universe(uni, nse_map, bse_map):
     unmapped = sorted(out[out["instrument_key"].isna()]["symbol"].tolist())
     return mapped, unmapped
 
+def full_universe(exch="NSE", instruments=None):
+    """Build the ENTIRE NSE/BSE cash-equity universe from Upstox's instrument list
+    (ignores any user CSV). Returns DataFrame[symbol,name,sector,exch,instrument_key]."""
+    instruments = instruments or load_instruments()
+    NSE_TYPES = ("EQ", "BE", "BZ", "SM", "ST")
+    rows = []; seen_nse = set(); seen_bse = set()
+    # NSE first, EQ-priority, so EQ wins over BE/SM duplicates
+    if exch in ("NSE", "Both"):
+        for t in NSE_TYPES:
+            for d in instruments:
+                if d.get("segment") != "NSE_EQ" or d.get("instrument_type") != t: continue
+                sym = str(d.get("trading_symbol", "")).strip().upper(); key = d.get("instrument_key")
+                if sym and key and sym not in seen_nse:
+                    seen_nse.add(sym)
+                    rows.append(dict(symbol=sym, name=d.get("name") or sym, sector="",
+                                     exch="NSE", instrument_key=key))
+    if exch in ("BSE", "Both"):
+        for d in instruments:
+            if d.get("segment") != "BSE_EQ" or d.get("instrument_type") in ("F", "IF"): continue
+            sym = str(d.get("trading_symbol", "")).strip().upper(); key = d.get("instrument_key")
+            if sym and key and sym not in seen_bse:
+                seen_bse.add(sym)
+                rows.append(dict(symbol=sym, name=d.get("name") or sym, sector="",
+                                 exch="BSE", instrument_key=key))
+    return pd.DataFrame(rows)
+
 # --------------------------------------------------------- daily fetch ----
 def fetch_daily(instrument_key, from_date, to_date, token=None, retries=2):
     ik = urllib.parse.quote(instrument_key, safe="")

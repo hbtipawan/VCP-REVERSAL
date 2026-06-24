@@ -107,6 +107,30 @@ def map_universe(uni, nse_map, bse_map):
     unmapped = sorted(out[out["security_id"].isna()]["symbol"].tolist())
     return mapped, unmapped
 
+def full_universe(exch="NSE", scrip=None):
+    """Build the ENTIRE NSE/BSE cash-equity universe from Dhan's scrip master.
+    Returns DataFrame[symbol,name,sector,exch,security_id,exchange_segment,instrument]."""
+    scrip = scrip if scrip is not None else load_scrip_master()
+    eq = scrip[scrip["SEM_INSTRUMENT_NAME"].astype(str).str.strip() == "EQUITY"].copy()
+    eq["sym"] = eq["SEM_TRADING_SYMBOL"].astype(str).str.strip().str.upper()
+    eq["ser"] = eq["SEM_SERIES"].astype(str).str.strip()
+    nm_col = "SM_SYMBOL_NAME" if "SM_SYMBOL_NAME" in eq.columns else "SEM_CUSTOM_SYMBOL"
+    rows = []
+    def add(df, exch_id, seg):
+        seen = set()
+        for sym, sid, nm in zip(df["sym"], df["SEM_SMST_SECURITY_ID"], df[nm_col]):
+            if sym and sym not in seen and pd.notna(sid):
+                seen.add(sym)
+                rows.append(dict(symbol=sym, name=str(nm), sector="", exch=exch_id,
+                                 security_id=str(int(sid)), exchange_segment=seg, instrument="EQUITY"))
+    if exch in ("NSE", "Both"):
+        nse = eq[eq["SEM_EXM_EXCH_ID"] == "NSE"]
+        nse = pd.concat([nse[nse["ser"] == "EQ"], nse[nse["ser"] != "EQ"]])
+        add(nse, "NSE", "NSE_EQ")
+    if exch in ("BSE", "Both"):
+        add(eq[eq["SEM_EXM_EXCH_ID"] == "BSE"], "BSE", "BSE_EQ")
+    return pd.DataFrame(rows)
+
 # --------------------------------------------------------- daily fetch ----
 def fetch_daily(security_id, exchange_segment, instrument, from_date, to_date,
                 token, client_id=None, retries=2):

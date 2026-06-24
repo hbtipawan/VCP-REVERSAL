@@ -19,6 +19,7 @@ screener_core.py              # reversal-pattern engine
 vcp_core.py                   # VCP engine (backtest-tuned)
 upstox_data.py                # Upstox data layer (free, no token) — recommended
 dhan_data.py                  # Dhan data layer (paid Data API + token/TOTP)
+marketcap.py                  # market-cap lookup (₹ Crore) for result stocks
 bullish_reversal_screener.py  # optional command-line reversal runner
 requirements.txt
 EQUITY_L_2.csv                # NSE list  (cols: companyId, Name, Sector, Industry)
@@ -82,6 +83,11 @@ python3 bullish_reversal_screener.py --all
   downtrend gate to weekly bars (fetches ~5y of history) — fewer, slower, but more
   significant signals. The latest weekly candle is the in-progress week.
 - **Sectors**: optional filter (NSE Sector / BSE Industry).
+- **Scan entire NSE/BSE universe (ignore my list)**: an add-on toggle. When on, the app
+  screens *every* cash-equity on the chosen exchange(s) pulled straight from the data
+  source (≈3,200 NSE, ≈6,000 BSE) instead of your uploaded CSVs — useful when you don't
+  want to maintain a list. Your CSVs are still the default when it's off. (Sector filtering
+  isn't available in full-universe mode, since the master lists carry no sector field.)
 - **Max stocks to scan**: cap for a quick run, or tick **Scan ALL matching stocks**
   to scan the entire filtered list in one pass. Large scans (>500) auto-throttle
   (fewer threads + a small per-request delay) to respect data-source rate limits
@@ -91,6 +97,8 @@ python3 bullish_reversal_screener.py --all
   signals from the last few sessions.
 - **Volume-confirmed only**: show only signals whose signal-bar volume >=1.5x its
   20-day average.
+- Every result row shows a **Market Cap (₹ Crore)** column. It's fetched only for the
+  result stocks (not the whole universe), so it's quick; it shows a dash if unavailable.
 - **Run scan** -> results appear. Each **stock symbol is a clickable link that opens
   its TradingView chart** in a new tab. There's also a button to download a full
   standalone HTML report (symbols clickable there too).
