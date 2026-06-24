@@ -36,19 +36,26 @@ def load_instruments():
 
 def build_symbol_maps(instruments=None):
     """Return (nse_map, bse_map): {UPPER_SYMBOL: instrument_key} for cash equities.
-    NSE equities are instrument_type 'EQ'; BSE equities use group codes (A/B/T/X/...),
-    so for BSE we take all BSE_EQ rows except debt (F/IF)."""
+    NSE equities span types EQ (main board), BE/BZ (trade-to-trade) and SM/ST (SME);
+    we include all of those (preferring EQ) and skip bonds/G-secs/T-bills. BSE equities
+    use group codes (A/B/T/X/...), so for BSE we take all BSE_EQ rows except debt (F/IF)."""
     instruments = instruments or load_instruments()
-    nse, bse = {}, {}
+    NSE_EQUITY_TYPES = ("EQ", "BE", "BZ", "SM", "ST")   # priority order; EQ first
+    nse_by_type = {t: {} for t in NSE_EQUITY_TYPES}
+    bse = {}
     for d in instruments:
         seg = d.get("segment"); itype = d.get("instrument_type")
         sym = str(d.get("trading_symbol", "")).strip().upper()
         key = d.get("instrument_key")
         if not sym or not key: continue
-        if seg == "NSE_EQ" and itype == "EQ" and sym not in nse:
-            nse[sym] = key
+        if seg == "NSE_EQ" and itype in nse_by_type:
+            nse_by_type[itype].setdefault(sym, key)
         elif seg == "BSE_EQ" and itype not in ("F", "IF") and sym not in bse:
             bse[sym] = key
+    nse = {}
+    for t in NSE_EQUITY_TYPES:                          # merge with EQ taking priority
+        for sym, key in nse_by_type[t].items():
+            nse.setdefault(sym, key)
     return nse, bse
 
 def map_universe(uni, nse_map, bse_map):
@@ -74,7 +81,9 @@ def fetch_daily(instrument_key, from_date, to_date, token=None, retries=2):
             candles = (d.get("data") or {}).get("candles") or []
             if not candles: return None
             df = pd.DataFrame(candles, columns=["ts","open","high","low","close","volume","oi"])
-            df["date"] = pd.to_datetime(df["ts"], utc=True).dt.tz_localize(None).dt.normalize()
+            # ts is IST (e.g. 2026-02-01T00:00:00+05:30); take the trading date directly
+            # (converting to UTC would roll IST-midnight back to the previous day).
+            df["date"] = pd.to_datetime(df["ts"].astype(str).str[:10])
             df = df[["date","open","high","low","close","volume"]].iloc[::-1].reset_index(drop=True)
             for c in ("open","high","low","close","volume"):
                 df[c] = pd.to_numeric(df[c], errors="coerce")
