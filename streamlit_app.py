@@ -16,6 +16,7 @@ Deploy: push this + screener_core.py + vcp_core.py + dhan_data.py + EQUITY_L_2.c
 import os, threading, datetime as dt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import screener_core as sc
 import vcp_core as vc
 import dhan_data as dd
@@ -176,6 +177,110 @@ def vcp_table(rows):
     return ("<table class='res'><tr><th>Grade</th><th>Status</th><th>Symbol</th><th>Close</th><th>Tight</th>"
             "<th>Base</th><th>Contr</th><th>Dry</th><th>Near hi</th><th>RS</th><th>Pivot</th><th>To pivot</th>"
             "<th>Vol</th><th>Stop</th><th>2R tgt</th><th>Mkt Cap</th><th>Company</th></tr>" + trs + "</table>")
+
+# =============================== SORTABLE TABLE ====================================
+_SORT_CSS = """<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0e1117;color:#e7ebf2;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+table{border-collapse:collapse;width:100%;font-size:16px}
+thead th{position:sticky;top:0;background:#0f1622;color:#bcd6ff;z-index:2;padding:12px 12px;
+  text-align:right;white-space:nowrap;cursor:pointer;border-bottom:2px solid #2c3a55;font-weight:700;
+  user-select:none;font-size:15px}
+thead th:hover{background:#15203046;color:#fff}
+th.l,td.l{text-align:left}
+th .ar{color:#5cc8ff;font-size:13px}
+tbody td{padding:11px 12px;text-align:right;white-space:nowrap;border-bottom:1px solid #1b2430}
+tbody tr:nth-child(even){background:#121822}
+tbody tr:hover{background:#1b2740}
+a{color:#6cb4ff;text-decoration:none;font-weight:700}
+a:hover{text-decoration:underline}
+.ex{color:#8190a6;font-size:11px;margin-left:6px;padding:1px 5px;border:1px solid #36435c;border-radius:4px}
+.grade{display:inline-block;min-width:22px;padding:3px 9px;border-radius:6px;color:#fff;font-weight:800;text-align:center}
+.stt{padding:3px 10px;border-radius:12px;font-size:13px;font-weight:700}
+.bk{background:#0f3d20;color:#5be08a;border:1px solid #1f6e3a}
+.co{background:#172033;color:#9fb4d4;border:1px solid #2f3e57}
+.nm{color:#9aa7bd;font-size:14px;white-space:normal}
+.note{color:#8ea0ba;font-size:13px;white-space:normal;max-width:340px}
+.vok{color:#5be08a;font-weight:700}.vno{color:#6b7688}
+.hint{color:#7e8aa0;font-size:13px;padding:6px 2px 10px}
+</style>"""
+
+_SORT_JS = """<script>
+const tbl=document.getElementById('tbl'), tb=tbl.tBodies[0], ths=tbl.tHead.rows[0].cells;
+let cur=-1, asc=true;
+for(let i=0;i<ths.length;i++){ths[i].addEventListener('click',()=>{
+  asc=(cur===i)?!asc:true; cur=i;
+  const num=ths[i].dataset.t==='num';
+  [...tb.rows].sort((a,b)=>{
+    let x=a.cells[i].dataset.v, y=b.cells[i].dataset.v;
+    if(num){x=parseFloat(x);y=parseFloat(y);if(isNaN(x))x=-1e18;if(isNaN(y))y=-1e18;return asc?x-y:y-x;}
+    x=(x||'').toString().toLowerCase();y=(y||'').toString().toLowerCase();
+    return asc?(x<y?-1:x>y?1:0):(x>y?-1:x<y?1:0);
+  }).forEach(r=>tb.appendChild(r));
+  for(let j=0;j<ths.length;j++){const s=ths[j].querySelector('.ar');if(s)s.textContent=(j===i)?(asc?' \u25B2':' \u25BC'):'';}
+});}
+</script>"""
+
+def _attr(v):
+    return str(v).replace('&','&amp;').replace('"','&quot;').replace('<','&lt;').replace('>','&gt;')
+
+def render_sortable(columns, rows, height=None):
+    head = "".join(f"<th data-t='{c['type']}' class='{c.get('cls','')}'>{c['label']}<span class='ar'></span></th>"
+                   for c in columns)
+    body = ""
+    for r in rows:
+        body += "<tr>" + "".join(
+            f"<td data-v=\"{_attr(c['v'](r))}\" class='{c.get('cls','')}'>{c['c'](r)}</td>" for c in columns) + "</tr>"
+    html = (_SORT_CSS + "<div class='hint'>Tap any column header to sort &mdash; tap again to reverse.</div>"
+            + f"<table id='tbl'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>" + _SORT_JS)
+    components.html(html, height=height or min(820, 150 + 44*len(rows)), scrolling=True)
+
+_GCOL = {"A": "#1b7a2f", "B": "#0d47a1", "C": "#8a6d00"}
+def _sym_cell(r):
+    return (f"<a href='{sc.tv_url(r['exch'], r['symbol'])}' target='_blank' rel='noopener'>{r['symbol']}</a>"
+            f"<span class='ex'>{r['exch']}</span>")
+def _mc_v(r):
+    v = r.get('mcap_cr'); return v if v is not None else -1
+
+def vcp_columns():
+    return [
+        {"label":"Grade","type":"text","cls":"l","v":lambda r:r['grade'],
+         "c":lambda r:f"<span class='grade' style='background:{_GCOL.get(r['grade'],'#445')}'>{r['grade']}</span>"},
+        {"label":"Status","type":"text","cls":"l","v":lambda r:r['status'],
+         "c":lambda r:f"<span class='stt {'bk' if r['status']=='Breakout' else 'co'}'>{r['status']}</span>"},
+        {"label":"Symbol","type":"text","cls":"l","v":lambda r:r['symbol'],"c":_sym_cell},
+        {"label":"Close","type":"num","v":lambda r:r['close'],"c":lambda r:f"{r['close']}"},
+        {"label":"Tight","type":"num","v":lambda r:r['tightness'],"c":lambda r:f"{r['tightness']}%"},
+        {"label":"Base","type":"num","v":lambda r:r['base_len'],"c":lambda r:f"{r['base_len']}"},
+        {"label":"Contr","type":"num","v":lambda r:r['contraction'],"c":lambda r:f"{r['contraction']}"},
+        {"label":"Dry","type":"num","v":lambda r:r['dryup'],"c":lambda r:f"{r['dryup']}"},
+        {"label":"Near hi","type":"num","v":lambda r:r['near_high'],"c":lambda r:f"{r['near_high']}%"},
+        {"label":"RS","type":"num","v":lambda r:r['rs'],"c":lambda r:f"{r['rs']}%"},
+        {"label":"Pivot","type":"num","v":lambda r:r['pivot'],"c":lambda r:f"{r['pivot']}"},
+        {"label":"To pivot","type":"num","v":lambda r:r['dist_pivot'],"c":lambda r:f"{r['dist_pivot']}%"},
+        {"label":"Vol","type":"num","v":lambda r:r['vol_surge'],"c":lambda r:f"{r['vol_surge']}x"},
+        {"label":"Stop","type":"num","v":lambda r:r['stop'],"c":lambda r:f"{r['stop']}"},
+        {"label":"2R tgt","type":"num","v":lambda r:r['target'],"c":lambda r:f"{r['target']}"},
+        {"label":"Mkt Cap","type":"num","v":_mc_v,"c":lambda r:mcap.fmt_cr(r.get('mcap_cr'))},
+        {"label":"Company","type":"text","cls":"l nm","v":lambda r:r['name'],"c":lambda r:_attr(r['name'])},
+    ]
+
+def rev_columns(unit="d"):
+    return [
+        {"label":"Symbol","type":"text","cls":"l","v":lambda r:r['symbol'],"c":_sym_cell},
+        {"label":"Close","type":"num","v":lambda r:r['close'],"c":lambda r:f"{r['close']}"},
+        {"label":"When","type":"num","v":lambda r:r['bars_ago'],
+         "c":lambda r:("today" if r['bars_ago']==0 else f"{r['bars_ago']}{unit} ago")},
+        {"label":"Vol vs avg","type":"num","v":lambda r:(r['vol_ratio'] if r['vol_ratio'] is not None else -1),
+         "c":lambda r:(f"{r['vol_ratio']}x" if r['vol_ratio'] is not None else "&mdash;")
+                      + (" <span class='vok'>&#10003;</span>" if r['vol_confirmed'] else "")},
+        {"label":"Stop","type":"num","v":lambda r:r['stop'],"c":lambda r:f"{r['stop']}"},
+        {"label":"Risk","type":"num","v":lambda r:r['risk'],"c":lambda r:f"{r['risk']}%"},
+        {"label":"2R tgt","type":"num","v":lambda r:r['target'],"c":lambda r:f"{r['target']}"},
+        {"label":"Mkt Cap","type":"num","v":_mc_v,"c":lambda r:mcap.fmt_cr(r.get('mcap_cr'))},
+        {"label":"Company","type":"text","cls":"l nm","v":lambda r:r['name'],"c":lambda r:_attr(r['name'])},
+        {"label":"Read","type":"text","cls":"l note","v":lambda r:r.get('note',''),"c":lambda r:_attr(r.get('note',''))},
+    ]
 
 # =================================== SIDEBAR ========================================
 st.sidebar.title("Scanner")
@@ -443,7 +548,7 @@ if R and R["mode"] == "reversal" and scanner == "Reversal patterns":
             st.markdown(f"<p class='litline'>{lit}</p>", unsafe_allow_html=True)
             gate = "prior downtrend required" + (" + near a recent low" if plen == 1 else "")
             st.markdown(f"<p class='gateline'>Location gate: {gate}. Volume-confirmed first.</p>", unsafe_allow_html=True)
-            if disp[name]: st.markdown(reversal_table(disp[name], unit), unsafe_allow_html=True)
+            if disp[name]: render_sortable(rev_columns(unit), disp[name])
             else: st.info("No fresh signals in this category.")
     html = sc.build_html(results, scanned, failed, R["scan_n"], timeframe=tf)
     st.download_button("Download full HTML report", data=html,
@@ -470,7 +575,7 @@ elif R and R["mode"] == "vcp" and scanner == "VCP breakout":
     if scanned == 0 and failed:
         st.error("No data returned for any stock. If using Dhan, check your access-token and Data API subscription.")
     if disp:
-        st.markdown(vcp_table(disp), unsafe_allow_html=True)
+        render_sortable(vcp_columns(), disp)
     elif scanned:
         st.info("No VCP candidates matched your filters. VCP is strict by design — loosen the near-high %, "
                 "trend strictness, or grade filter, or scan a wider universe.")
