@@ -248,6 +248,10 @@ def vcp_columns():
          "c":lambda r:f"<span class='grade' style='background:{_GCOL.get(r['grade'],'#445')}'>{r['grade']}</span>"},
         {"label":"Status","type":"text","cls":"l","v":lambda r:r['status'],
          "c":lambda r:f"<span class='stt {'bk' if r['status']=='Breakout' else 'co'}'>{r['status']}</span>"},
+        {"label":"Type","type":"text","cls":"l","v":lambda r:r.get('base_type','Flat'),
+         "c":lambda r:r.get('base_type','Flat')},
+        {"label":"Slope","type":"num","v":lambda r:(r.get('slope') if r.get('slope') is not None else 0),
+         "c":lambda r:(f"{r['slope']:+.2f}" if r.get('slope') is not None else "&mdash;")},
         {"label":"Symbol","type":"text","cls":"l","v":lambda r:r['symbol'],"c":_sym_cell},
         {"label":"Close","type":"num","v":lambda r:r['close'],"c":lambda r:f"{r['close']}"},
         {"label":"Tight","type":"num","v":lambda r:r['tightness'],"c":lambda r:f"{r['tightness']}%"},
@@ -403,6 +407,7 @@ else:
 scan_n = 1; vol_only = False
 near_high = 25; max_tight = 5; min_base = 3; strictness = "Strict"; min_grade = "All (A/B/C)"; status_f = "All"
 low_on = True; low_min = 30.0; low_max = None
+wedge_on = False; wedge_lo = 0.05; wedge_hi = 0.80; base_f = "All"
 if scanner == "Reversal patterns":
     scan_n  = st.sidebar.slider("Scan signals from last N bars", 1, 3, 1)
     vol_only = st.sidebar.checkbox("Show volume-confirmed signals only", value=False)
@@ -425,6 +430,18 @@ else:
         low_on = True; low_min = float(low_lo); low_max = None if low_hi >= 500 else float(low_hi)
     else:
         low_on = False; low_min = 30.0; low_max = None
+    wedge_on = st.sidebar.checkbox("Also find sloping / wedge bases", value=False,
+                help="Adds Ascending (rising-trendline accumulation) and Descending (falling-resistance coil) "
+                     "bases that the flat-box detector can't see. Runs only when the flat scan finds nothing, "
+                     "so it never changes a flat result. Grades for these are heuristic \u2014 backtest before trusting.")
+    if wedge_on:
+        wlo, whi = st.sidebar.slider("Wedge trendline slope (% per bar)", 0.0, 1.5, (0.05, 0.80), step=0.05,
+                help="Allowed slope of the dominant trendline. Lower handle keeps out near-flat lines "
+                     "(use the flat detector for those); upper handle keeps out too-steep, parabolic moves.")
+        wedge_lo, wedge_hi = float(wlo), float(whi)
+        base_f = st.sidebar.selectbox("Base type", ["All", "Flat", "Ascending", "Descending"], index=0)
+    else:
+        wedge_lo, wedge_hi = 0.05, 0.80; base_f = "All"
 
 dft_workers = 5 if source == "Dhan" else 8
 workers = st.sidebar.slider("Fetch threads", 1, 16, dft_workers,
@@ -528,7 +545,8 @@ if run:
                                             near_high_pct=near_high/100, max_tight=max_tight/100,
                                             min_base=min_base, strictness=strictness, max_workers=base_workers,
                                             progress=prog, request_delay=req_delay, nifty_ret=nret,
-                                            low_dist_on=low_on, low_dist_min=low_min, low_dist_max=low_max)
+                                            low_dist_on=low_on, low_dist_min=low_min, low_dist_max=low_max,
+                                            wedge_on=wedge_on, wedge_slope_min=wedge_lo, wedge_slope_max=wedge_hi)
             except PermissionError as e:
                 bar.empty(); st.error(str(e)); st.stop()
         bar.empty()
@@ -580,7 +598,8 @@ elif R and R["mode"] == "vcp" and scanner == "VCP breakout":
         for r in cands: r["mcap_cr"] = _caps.get((r["symbol"], r["exch"])); r["mcap_done"] = True
     tf = R.get("timeframe", "Daily")
     allow = {"A only": {"A"}, "A & B": {"A", "B"}, "All (A/B/C)": {"A", "B", "C"}}[min_grade]
-    disp = [r for r in cands if r["grade"] in allow and (status_f == "All" or r["status"] == status_f)]
+    disp = [r for r in cands if r["grade"] in allow and (status_f == "All" or r["status"] == status_f)
+            and (base_f == "All" or r.get("base_type", "Flat") == base_f)]
     nA = sum(1 for r in disp if r["grade"] == "A"); nB = sum(1 for r in disp if r["grade"] == "B")
     nBO = sum(1 for r in disp if r["status"] == "Breakout")
     c1, c2, c3, c4 = st.columns(4)
