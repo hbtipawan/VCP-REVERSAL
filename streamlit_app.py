@@ -255,6 +255,8 @@ def vcp_columns():
         {"label":"Contr","type":"num","v":lambda r:r['contraction'],"c":lambda r:f"{r['contraction']}"},
         {"label":"Dry","type":"num","v":lambda r:r['dryup'],"c":lambda r:f"{r['dryup']}"},
         {"label":"Near hi","type":"num","v":lambda r:r['near_high'],"c":lambda r:f"{r['near_high']}%"},
+        {"label":"From low","type":"num","v":lambda r:(r.get('low_dist') if r.get('low_dist') is not None else -1),
+         "c":lambda r:(f"{r['low_dist']}%" if r.get('low_dist') is not None else "&mdash;")},
         {"label":"RS","type":"num","v":lambda r:r['rs'],"c":lambda r:f"{r['rs']}%"},
         {"label":"Pivot","type":"num","v":lambda r:r['pivot'],"c":lambda r:f"{r['pivot']}"},
         {"label":"To pivot","type":"num","v":lambda r:r['dist_pivot'],"c":lambda r:f"{r['dist_pivot']}%"},
@@ -400,6 +402,7 @@ else:
 
 scan_n = 1; vol_only = False
 near_high = 25; max_tight = 5; min_base = 3; strictness = "Strict"; min_grade = "All (A/B/C)"; status_f = "All"
+low_on = True; low_min = 30.0; low_max = None
 if scanner == "Reversal patterns":
     scan_n  = st.sidebar.slider("Scan signals from last N bars", 1, 3, 1)
     vol_only = st.sidebar.checkbox("Show volume-confirmed signals only", value=False)
@@ -411,6 +414,17 @@ else:
     strictness = st.sidebar.selectbox("Trend strictness", ["Strict", "Standard", "Relaxed"], index=0)
     min_grade = st.sidebar.selectbox("Minimum grade", ["A only", "A & B", "All (A/B/C)"], index=2)
     status_f  = st.sidebar.selectbox("Status", ["All", "Coiling", "Breakout"], index=0)
+    use_low = st.sidebar.checkbox("Filter by distance from 52-week low", value=True,
+                help="Keep only stocks whose price sits within this % band above their 52-period low. "
+                     "Untick to drop the filter entirely (removes the old \u226530%-above-low floor).")
+    if use_low:
+        low_lo, low_hi = st.sidebar.slider("Distance above 52-week low (%)", 0, 500, (30, 500), step=5,
+                help="Lower handle screens out names still hugging their low (too early). "
+                     "Upper handle screens out names that have already run far off the low. "
+                     "Leave the upper handle at 500 for no upper cap.")
+        low_on = True; low_min = float(low_lo); low_max = None if low_hi >= 500 else float(low_hi)
+    else:
+        low_on = False; low_min = 30.0; low_max = None
 
 dft_workers = 5 if source == "Dhan" else 8
 workers = st.sidebar.slider("Fetch threads", 1, 16, dft_workers,
@@ -513,7 +527,8 @@ if run:
                 cands, scanned, failed = vc.run_vcp_screen(rows, fetch_fn=fetch_fn, timeframe=timeframe,
                                             near_high_pct=near_high/100, max_tight=max_tight/100,
                                             min_base=min_base, strictness=strictness, max_workers=base_workers,
-                                            progress=prog, request_delay=req_delay, nifty_ret=nret)
+                                            progress=prog, request_delay=req_delay, nifty_ret=nret,
+                                            low_dist_on=low_on, low_dist_min=low_min, low_dist_max=low_max)
             except PermissionError as e:
                 bar.empty(); st.error(str(e)); st.stop()
         bar.empty()

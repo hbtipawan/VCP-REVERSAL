@@ -52,7 +52,8 @@ def _funnel(A, end, F, c):
     return rp(end-F+1,end-2*w), rp(end-2*w+1,end-w), rp(end-w+1,end)
 
 def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
-                min_base=3, strictness="Strict", nifty_mom_ret=0.0):
+                min_base=3, strictness="Strict", nifty_mom_ret=0.0,
+                low_dist_on=True, low_dist_min=30.0, low_dist_max=None):
     p=tf_params(timeframe); A=vcp_arrays(df,p); n=A['n']
     if n < max(p['mal'], p['win'])+5: return None
     i=n-1; c=A['c'][i]
@@ -70,7 +71,10 @@ def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
     hi52=np.nanmax(A['h'][i-p['win']+1:i+1]); lo52=np.nanmin(A['l'][i-p['win']+1:i+1])
     nh=(hi52-c)/hi52
     if nh > near_high_pct: return None                       # within near_high_pct of 52-period high
-    if c < 1.30*lo52: return None                            # >=30% above the 52-period low
+    dist_low=(c/lo52-1.0)*100.0 if (_ok(lo52) and lo52>0) else None   # % above the 52-period low
+    if low_dist_on and dist_low is not None:                 # optional distance-from-low band (toggleable)
+        if dist_low < low_dist_min: return None              #   floor: keep out names too close to the low
+        if low_dist_max is not None and dist_low > low_dist_max: return None  # cap: keep out over-extended names
     vol50=A['vol50'][i]; vol_surge=A['v'][i]/vol50 if _ok(vol50) and vol50>0 else 0
     F=p['funnel']
     def assess(end):
@@ -114,7 +118,8 @@ def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
         sector=row.get('sector',''), close=round(c,2), status=status, grade=grade, score=score,
         base_len=int(base['bk']), tightness=round(base['tight']*100,1),
         contraction=round(base['contr'],2), dryup=round(base['dry'],2),
-        near_high=round(nh*100,1), rs=round(rs*100,1), pivot=round(base['piv'],2),
+        near_high=round(nh*100,1), low_dist=(round(dist_low,1) if dist_low is not None else None),
+        rs=round(rs*100,1), pivot=round(base['piv'],2),
         stop=round(base['blo'],2), dist_pivot=round((base['piv']-c)/c*100,2),
         vol_surge=round(vol_surge,2), target=round(c+2*(c-base['blo']),2),
         date=str(df['date'].iloc[i].date()))
@@ -148,17 +153,18 @@ def build_vcp_html(rows, scanned, failed, timeframe="Daily", summary=""):
     for r in rows:
         g=r['grade']; st_="Breakout" if r['status']=="Breakout" else "Coiling"
         stcss="bk" if r['status']=="Breakout" else "co"
+        ld_=f"{r['low_dist']}%" if r.get('low_dist') is not None else "&mdash;"
         trs+=(f"<tr><td><span class='grade' style='background:{gcol.get(g,'#445')}'>{g}</span></td>"
               f"<td><span class='stt {stcss}'>{st_}</span></td>"
               f"<td class='sym'><a href='{sc.tv_url(r['exch'],r['symbol'])}' target='_blank' "
               f"rel='noopener'>{r['symbol']}</a><span class='ex'>{r['exch']}</span></td>"
               f"<td>{r['close']}</td><td>{r['tightness']}%</td><td>{r['base_len']}</td>"
-              f"<td>{r['contraction']}</td><td>{r['dryup']}</td><td>{r['near_high']}%</td>"
+              f"<td>{r['contraction']}</td><td>{r['dryup']}</td><td>{r['near_high']}%</td><td>{ld_}</td>"
               f"<td>{r['rs']}%</td><td>{r['pivot']}</td><td>{r['dist_pivot']}%</td>"
               f"<td>{r['vol_surge']}x</td><td>{r['stop']}</td><td>{r['target']}</td>"
               f"<td>{_mc(r.get('mcap_cr'))}</td><td class='nm'>{r['name']}</td></tr>")
     body=(f"<table><tr><th>Grade</th><th>Status</th><th>Symbol</th><th>Close</th><th>Tight</th>"
-          f"<th>Base</th><th>Contr</th><th>Dry</th><th>Near hi</th><th>RS</th><th>Pivot</th>"
+          f"<th>Base</th><th>Contr</th><th>Dry</th><th>Near hi</th><th>From low</th><th>RS</th><th>Pivot</th>"
           f"<th>To pivot</th><th>Vol</th><th>Stop</th><th>2R tgt</th><th>Mkt Cap</th><th>Company</th></tr>{trs}</table>"
           if rows else "<div class='empty'>No VCP candidates matched.</div>")
     return f"""<!doctype html><html><head><meta charset="utf-8">
@@ -191,7 +197,8 @@ Pivot, stop at base low. Grade reflects base quality. Research tool, not investm
 
 def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
                    max_tight=0.05, min_base=3, strictness="Strict", max_workers=8,
-                   progress=None, request_delay=0.0, nifty_ret=0.0):
+                   progress=None, request_delay=0.0, nifty_ret=0.0,
+                   low_dist_on=True, low_dist_min=30.0, low_dist_max=None):
     fetch_fn = fetch_fn or (lambda row: sc.fetch_ohlcv(row["yahoo"]))
     out=[]; scanned=0; failed=[]; total=len(rows); done=0
     def work(r):
@@ -204,7 +211,8 @@ def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
             if df is None or len(df)<60: failed.append(r["symbol"])
             else:
                 scanned+=1
-                try: m=analyze_vcp(df,r,timeframe,near_high_pct,max_tight,min_base,strictness,nifty_ret)
+                try: m=analyze_vcp(df,r,timeframe,near_high_pct,max_tight,min_base,strictness,nifty_ret,
+                                   low_dist_on,low_dist_min,low_dist_max)
                 except Exception: m=None
                 if m: out.append(m)
             if progress: progress(done,total,r["symbol"])
