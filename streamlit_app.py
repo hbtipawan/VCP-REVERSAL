@@ -250,8 +250,11 @@ def vcp_columns():
          "c":lambda r:f"<span class='stt {'bk' if r['status']=='Breakout' else 'co'}'>{r['status']}</span>"},
         {"label":"Type","type":"text","cls":"l","v":lambda r:r.get('base_type','Flat'),
          "c":lambda r:r.get('base_type','Flat')},
-        {"label":"Slope","type":"num","v":lambda r:(r.get('slope') if r.get('slope') is not None else 0),
-         "c":lambda r:(f"{r['slope']:+.2f}" if r.get('slope') is not None else "&mdash;")},
+        {"label":"Slope/Pole","type":"num",
+         "v":lambda r:(r.get('pole') if r.get('base_type')=='HiTightFlag' and r.get('pole') is not None
+                       else (r.get('slope') if r.get('slope') is not None else 0)),
+         "c":lambda r:(f"+{r['pole']:.0f}% pole" if r.get('base_type')=='HiTightFlag' and r.get('pole') is not None
+                       else (f"{r['slope']:+.2f}/bar" if r.get('slope') is not None else "&mdash;"))},
         {"label":"Symbol","type":"text","cls":"l","v":lambda r:r['symbol'],"c":_sym_cell},
         {"label":"Close","type":"num","v":lambda r:r['close'],"c":lambda r:f"{r['close']}"},
         {"label":"Tight","type":"num","v":lambda r:r['tightness'],"c":lambda r:f"{r['tightness']}%"},
@@ -408,6 +411,7 @@ scan_n = 1; vol_only = False
 near_high = 25; max_tight = 5; min_base = 3; strictness = "Strict"; min_grade = "All (A/B/C)"; status_f = "All"
 low_on = True; low_min = 30.0; low_max = None
 wedge_on = False; wedge_lo = 0.05; wedge_hi = 0.80; base_f = "All"
+htf_on = False; htf_thrust = 80; htf_flag = 25
 if scanner == "Reversal patterns":
     scan_n  = st.sidebar.slider("Scan signals from last N bars", 1, 3, 1)
     vol_only = st.sidebar.checkbox("Show volume-confirmed signals only", value=False)
@@ -439,9 +443,20 @@ else:
                 help="Allowed slope of the dominant trendline. Lower handle keeps out near-flat lines "
                      "(use the flat detector for those); upper handle keeps out too-steep, parabolic moves.")
         wedge_lo, wedge_hi = float(wlo), float(whi)
-        base_f = st.sidebar.selectbox("Base type", ["All", "Flat", "Ascending", "Descending"], index=0)
     else:
-        wedge_lo, wedge_hi = 0.05, 0.80; base_f = "All"
+        wedge_lo, wedge_hi = 0.05, 0.80
+    htf_on = st.sidebar.checkbox("Also find High Tight Flags", value=False,
+                help="Adds HiTightFlag \u2014 a tight, shallow consolidation atop a recent powerful pole "
+                     "(a continuation pattern). Runs only when flat + wedge find nothing, so it never changes "
+                     "those results. Grades are heuristic \u2014 backtest before trusting.")
+    if htf_on:
+        htf_thrust = st.sidebar.slider("Min pole gain into the flag (%)", 40, 150, 80, step=5,
+                help="How far price must have run up over ~9 weeks before the flag. Classic HTF \u2248 90\u2013100%+.")
+        htf_flag = st.sidebar.slider("Max flag depth (%)", 5, 35, 25, step=1,
+                help="Maximum high-to-low retrace inside the flag. Tighter (lower) = higher quality.")
+    base_f = st.sidebar.selectbox("Base type", ["All", "Flat", "Ascending", "Descending", "HiTightFlag"], index=0,
+                help="Filter results by base shape. (Ascending/Descending need the wedge toggle; "
+                     "HiTightFlag needs the High Tight Flag toggle.)")
 
 dft_workers = 5 if source == "Dhan" else 8
 workers = st.sidebar.slider("Fetch threads", 1, 16, dft_workers,
@@ -546,7 +561,8 @@ if run:
                                             min_base=min_base, strictness=strictness, max_workers=base_workers,
                                             progress=prog, request_delay=req_delay, nifty_ret=nret,
                                             low_dist_on=low_on, low_dist_min=low_min, low_dist_max=low_max,
-                                            wedge_on=wedge_on, wedge_slope_min=wedge_lo, wedge_slope_max=wedge_hi)
+                                            wedge_on=wedge_on, wedge_slope_min=wedge_lo, wedge_slope_max=wedge_hi,
+                                            htf_on=htf_on, htf_thrust_min=htf_thrust/100, htf_flag_max=htf_flag/100)
             except PermissionError as e:
                 bar.empty(); st.error(str(e)); st.stop()
         bar.empty()

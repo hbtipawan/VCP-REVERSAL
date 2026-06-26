@@ -111,10 +111,56 @@ def wedge_base(A, end, c, max_tight, min_base, slope_lo, slope_hi, vol50,
         if best is None or rank>best[0]: best=(rank,cand)
     return best[1] if best else None
 
+def flat_base(A, end, c, max_tight, min_base, F, vol50):
+    """Validate a proper FLAT VCP base ending at `end`: tight, contracting, quiet.
+    Module-level so the live engine and the backtest share ONE implementation."""
+    bk,piv,blo=tight_base(A,end,max_tight)
+    if bk<min_base or piv<=0: return None
+    tight=(piv-blo)/c
+    r1,r2,r3=_funnel(A,end,F,c)
+    if not _ok(r1) or r1<=0 or not _ok(r3): return None
+    contr=r3/r1
+    if contr>1.0: return None                           # base must have net-contracted
+    seg=A['v'][end-bk+1:end+1]
+    dry=float(np.nanmean(seg))/vol50 if _ok(vol50) and vol50>0 else 1.0
+    if dry>1.0: return None                             # base must be quiet (volume dry-up)
+    return dict(bk=bk,piv=piv,blo=blo,tight=tight,contr=contr,dry=dry,type="Flat")
+
+def htf_base(A, end, c, max_tight, min_base, vol50,
+             thrust_min=0.80, flag_max=0.25, flag_min_len=4, flag_max_len=30, pole_win=45):
+    """High Tight Flag: a tight, shallow consolidation (the flag) sitting atop a recent
+    POWERFUL pole (a >= thrust_min advance into the flag over <= pole_win bars). A continuation
+    pattern — the flag may be deeper than a flat base (up to flag_max) but the pole is what
+    defines it. Returns a base dict (bk,piv,blo,tight,contr,dry + type/pole) or None.
+    Heuristic — NOT yet validated by the backtest."""
+    h=A['h']; l=A['l']; v=A['v']
+    best=None
+    for Lf in range(flag_min_len, min(flag_max_len, end-pole_win)+1):
+        s=end-Lf+1
+        if s-pole_win<0: continue
+        fhi=float(np.nanmax(h[s:end+1])); flo=float(np.nanmin(l[s:end+1]))
+        if fhi<=0: continue
+        depth=(fhi-flo)/fhi
+        if depth>flag_max: continue                     # flag must be shallow
+        pole_low=float(np.nanmin(l[s-pole_win:s]))
+        if pole_low<=0: continue
+        thrust=fhi/pole_low-1.0
+        if thrust<thrust_min: continue                  # need a powerful, recent pole
+        contr=(fhi-flo)/(fhi-pole_low) if fhi>pole_low else 1.0
+        if contr>0.5: continue                          # flag range must be small vs the pole
+        dry=float(np.nanmean(v[s:end+1]))/vol50 if (_ok(vol50) and vol50>0) else 1.0
+        if dry>1.0: continue                            # quiet flag
+        cand=dict(bk=Lf,piv=fhi,blo=flo,tight=depth,contr=round(contr,2),dry=dry,
+                  type="HiTightFlag",pole=round(thrust*100,1))
+        rank=(thrust,1.0-depth,1.0-contr)               # biggest pole, shallowest, tightest
+        if best is None or rank>best[0]: best=(rank,cand)
+    return best[1] if best else None
+
 def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
                 min_base=3, strictness="Strict", nifty_mom_ret=0.0,
                 low_dist_on=True, low_dist_min=30.0, low_dist_max=None,
-                wedge_on=False, wedge_slope_min=0.05, wedge_slope_max=0.80):
+                wedge_on=False, wedge_slope_min=0.05, wedge_slope_max=0.80,
+                htf_on=False, htf_thrust_min=0.80, htf_flag_max=0.25):
     p=tf_params(timeframe); A=vcp_arrays(df,p); n=A['n']
     if n < max(p['mal'], p['win'])+5: return None
     i=n-1; c=A['c'][i]
@@ -138,46 +184,44 @@ def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
         if low_dist_max is not None and dist_low > low_dist_max: return None  # cap: keep out over-extended names
     vol50=A['vol50'][i]; vol_surge=A['v'][i]/vol50 if _ok(vol50) and vol50>0 else 0
     F=p['funnel']
-    def assess(end):
-        """Validate a proper VCP base ending at `end`: tight, contracting, quiet."""
-        bk,piv,blo=tight_base(A,end,max_tight)
-        if bk<min_base or piv<=0: return None
-        tight=(piv-blo)/c
-        r1,r2,r3=_funnel(A,end,F,c)
-        if not _ok(r1) or r1<=0 or not _ok(r3): return None
-        contr=r3/r1
-        if contr>1.0: return None                           # base must have net-contracted
-        seg=A['v'][end-bk+1:end+1]
-        dry=float(np.nanmean(seg))/vol50 if _ok(vol50) and vol50>0 else 1.0
-        if dry>1.0: return None                             # base must be quiet (volume dry-up)
-        return dict(bk=bk,piv=piv,blo=blo,tight=tight,contr=contr,dry=dry)
     status=base=None
-    co=assess(i)                                            # coiling: base ends today, price under pivot
+    co=flat_base(A,i,c,max_tight,min_base,F,vol50)          # coiling: base ends today, price under pivot
     if co and c<=co['piv']*1.001 and c>=co['piv']*(1-0.06):
         status,base="Coiling",co
     else:                                                   # breakout: base ended yesterday, clears pivot on volume
-        bo=assess(i-1)
+        bo=flat_base(A,i-1,c,max_tight,min_base,F,vol50)
         if bo and c>bo['piv'] and vol_surge>=2.5:           # 2.5x+ surge (backtest: 2.5-4x best)
             status,base="Breakout",bo
-    base_type="Flat"; slope=None
-    if base is None:
-        # flat box found nothing -> optionally look for a sloping/converging wedge base.
-        # This only ADDS candidates the flat detector missed; it never alters a flat result.
-        if not wedge_on: return None
+    base_type="Flat"; slope=None; pole=None
+    # Fallbacks below ONLY run when the flat box found nothing, and only when toggled on.
+    # They can only ADD candidates the flat detector missed; they never alter a flat result.
+    if base is None and wedge_on:                           # --- sloping / converging wedge ---
         wc=wedge_base(A,i,c,max_tight,min_base,wedge_slope_min,wedge_slope_max,vol50)
         if wc and c<=wc['piv']*1.001 and c>=wc['piv']*(1-0.06):
-            status,base="Coiling",wc                        # coiling under the wedge pivot
+            status,base="Coiling",wc
         else:
             wb=wedge_base(A,i-1,c,max_tight,min_base,wedge_slope_min,wedge_slope_max,vol50)
             if wb and c>wb['piv'] and vol_surge>=2.5:
-                status,base="Breakout",wb                   # broke the wedge pivot today on volume
-        if base is None: return None
-        base_type=base['type']; slope=base['slope']
+                status,base="Breakout",wb
+        if base is not None:
+            base_type=base['type']; slope=base['slope']
+    if base is None and htf_on:                             # --- high tight flag (continuation) ---
+        hc=htf_base(A,i,c,max_tight,min_base,vol50,htf_thrust_min,htf_flag_max)
+        if hc and c<=hc['piv']*1.001 and c>=hc['piv']*(1-0.08):
+            status,base="Coiling",hc
+        else:
+            hb=htf_base(A,i-1,c,max_tight,min_base,vol50,htf_thrust_min,htf_flag_max)
+            if hb and c>hb['piv'] and vol_surge>=2.5:
+                status,base="Breakout",hb
+        if base is not None:
+            base_type="HiTightFlag"; pole=base.get('pole')
+    if base is None: return None
     mom=p['mom']; sret=(c/A['c'][i-mom]-1) if i-mom>=0 and A['c'][i-mom]>0 else 0.0
     rs=sret-(nifty_mom_ret or 0.0)
     # weights re-tuned from a 2,072-trade breakout backtest: proximity to 52w high,
     # relative strength, and a 2.5-4x breakout surge were the strongest return drivers.
-    s_tight=14*max(0,1-base['tight']/max_tight)
+    tight_ref = htf_flag_max if base_type=="HiTightFlag" else max_tight
+    s_tight=14*max(0,1-base['tight']/tight_ref)
     s_contr=12*float(np.clip(1-base['contr'],0,1))
     s_dry  =10*float(np.clip((1-base['dry'])/0.5,0,1))
     s_near =18*max(0,1-nh/near_high_pct)
@@ -196,7 +240,7 @@ def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
         rs=round(rs*100,1), pivot=round(base['piv'],2),
         stop=round(base['blo'],2), dist_pivot=round((base['piv']-c)/c*100,2),
         vol_surge=round(vol_surge,2), target=round(c+2*(c-base['blo']),2),
-        base_type=base_type, slope=slope,
+        base_type=base_type, slope=slope, pole=pole,
         date=str(df['date'].iloc[i].date()))
 
 def nifty_mom(timeframe="Daily", fetch_fn=None, nifty_row=None):
@@ -229,8 +273,10 @@ def build_vcp_html(rows, scanned, failed, timeframe="Daily", summary=""):
         g=r['grade']; st_="Breakout" if r['status']=="Breakout" else "Coiling"
         stcss="bk" if r['status']=="Breakout" else "co"
         ld_=f"{r['low_dist']}%" if r.get('low_dist') is not None else "&mdash;"
-        bt_=r.get('base_type','Flat'); btcss={"Ascending":"asc","Descending":"desc"}.get(bt_,"flat")
-        sl_=f"{r['slope']:+.2f}%/bar" if r.get('slope') is not None else "&mdash;"
+        bt_=r.get('base_type','Flat'); btcss={"Ascending":"asc","Descending":"desc","HiTightFlag":"htf"}.get(bt_,"flat")
+        if bt_=="HiTightFlag" and r.get('pole') is not None: sl_=f"+{r['pole']:.0f}% pole"
+        elif r.get('slope') is not None: sl_=f"{r['slope']:+.2f}%/bar"
+        else: sl_="&mdash;"
         trs+=(f"<tr><td><span class='grade' style='background:{gcol.get(g,'#445')}'>{g}</span></td>"
               f"<td><span class='stt {stcss}'>{st_}</span></td>"
               f"<td><span class='bt {btcss}'>{bt_}</span></td><td>{sl_}</td>"
@@ -241,7 +287,7 @@ def build_vcp_html(rows, scanned, failed, timeframe="Daily", summary=""):
               f"<td>{r['rs']}%</td><td>{r['pivot']}</td><td>{r['dist_pivot']}%</td>"
               f"<td>{r['vol_surge']}x</td><td>{r['stop']}</td><td>{r['target']}</td>"
               f"<td>{_mc(r.get('mcap_cr'))}</td><td class='nm'>{r['name']}</td></tr>")
-    body=(f"<table><tr><th>Grade</th><th>Status</th><th>Type</th><th>Slope</th><th>Symbol</th><th>Close</th><th>Tight</th>"
+    body=(f"<table><tr><th>Grade</th><th>Status</th><th>Type</th><th>Slope/Pole</th><th>Symbol</th><th>Close</th><th>Tight</th>"
           f"<th>Base</th><th>Contr</th><th>Dry</th><th>Near hi</th><th>From low</th><th>RS</th><th>Pivot</th>"
           f"<th>To pivot</th><th>Vol</th><th>Stop</th><th>2R tgt</th><th>Mkt Cap</th><th>Company</th></tr>{trs}</table>"
           if rows else "<div class='empty'>No VCP candidates matched.</div>")
@@ -263,7 +309,7 @@ th{{background:var(--panel);font-size:13px;text-transform:uppercase;color:var(--
 .stt.bk{{background:#e7f6ea;color:#1b7a2f}}.stt.co{{background:#eef2f8;color:#0d47a1}}
 .bt{{font-weight:800;padding:3px 9px;border-radius:7px;font-size:14px}}
 .bt.flat{{background:#eef2f8;color:#3a4654}}.bt.asc{{background:#e7f6ea;color:#1b7a2f}}
-.bt.desc{{background:#fff4e0;color:#8a6d00}}
+.bt.desc{{background:#fff4e0;color:#8a6d00}}.bt.htf{{background:#fdeaea;color:#b3261e}}
 .empty{{padding:22px;background:var(--panel);border:1px dashed var(--line);border-radius:12px;color:var(--mut)}}
 .foot{{margin-top:28px;font-size:15px;color:var(--mut);background:var(--panel);border:1px solid var(--line);
 border-radius:12px;padding:16px 18px}}</style></head><body><div class="wrap">
@@ -273,7 +319,8 @@ border-radius:12px;padding:16px 18px}}</style></head><body><div class="wrap">
 <div class="foot"><b>How to read:</b> <b>Coiling</b> = tight base under the pivot, ready; <b>Breakout</b> = today
 cleared the pivot on a volume surge (TARIL-type). <b>Type</b>: <b>Flat</b> = horizontal tight box;
 <b>Ascending</b> = higher lows on a rising support trendline (accumulation); <b>Descending</b> = falling
-resistance over holding lows, coiling into the apex. <b>Slope</b> = trendline slope in %/bar (Flat = &mdash;).
+resistance over holding lows, coiling into the apex; <b>HiTightFlag</b> = a tight shallow flag atop a recent
+powerful pole (the Slope/Pole column shows the pole gain %). <b>Slope</b> = trendline slope in %/bar (Flat = &mdash;).
 Tight = base span %; Dry = base volume vs 50-bar avg (lower = quieter base); Contr = recent vs earlier range
 (lower = contracting); enter on a move through the Pivot, stop at base low. Grade reflects base quality;
 Ascending/Descending grades are heuristic and not yet backtested. Research tool, not investment advice.</div>
@@ -283,7 +330,8 @@ def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
                    max_tight=0.05, min_base=3, strictness="Strict", max_workers=8,
                    progress=None, request_delay=0.0, nifty_ret=0.0,
                    low_dist_on=True, low_dist_min=30.0, low_dist_max=None,
-                   wedge_on=False, wedge_slope_min=0.05, wedge_slope_max=0.80):
+                   wedge_on=False, wedge_slope_min=0.05, wedge_slope_max=0.80,
+                   htf_on=False, htf_thrust_min=0.80, htf_flag_max=0.25):
     fetch_fn = fetch_fn or (lambda row: sc.fetch_ohlcv(row["yahoo"]))
     out=[]; scanned=0; failed=[]; total=len(rows); done=0
     def work(r):
@@ -298,7 +346,8 @@ def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
                 scanned+=1
                 try: m=analyze_vcp(df,r,timeframe,near_high_pct,max_tight,min_base,strictness,nifty_ret,
                                    low_dist_on,low_dist_min,low_dist_max,
-                                   wedge_on,wedge_slope_min,wedge_slope_max)
+                                   wedge_on,wedge_slope_min,wedge_slope_max,
+                                   htf_on,htf_thrust_min,htf_flag_max)
                 except Exception: m=None
                 if m: out.append(m)
             if progress: progress(done,total,r["symbol"])
