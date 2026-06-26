@@ -156,11 +156,102 @@ def htf_base(A, end, c, max_tight, min_base, vol50,
         if best is None or rank>best[0]: best=(rank,cand)
     return best[1] if best else None
 
+def cup_handle(A, end, c, vol50, min_depth=0.12, max_depth=0.40, handle_max=0.15,
+               hmin=3, hmax=25, cmin=18, cmax=130):
+    """Cup-with-handle (O'Neil / Minervini). A rounded U cup (depth min..max from the rim,
+    rims roughly level, U-shaped not V) followed by a small handle in the cup's UPPER HALF
+    that drifts down/flat on volume dry-up. Pivot = handle high, stop = handle low. Returns a
+    base dict (bk,piv,blo,tight,contr,dry + type/note/depth) or None. Heuristic \u2014 backtest first."""
+    h=A['h']; l=A['l']; v=A['v']
+    best=None
+    for Hf in range(hmin, hmax+1):
+        hs=end-Hf+1
+        if hs-cmin<0: break
+        h_hi=float(np.nanmax(h[hs:end+1])); h_lo=float(np.nanmin(l[hs:end+1]))
+        if h_hi<=0: continue
+        h_depth=(h_hi-h_lo)/h_hi
+        if h_depth>handle_max: continue                  # handle must be shallow
+        for Lc in range(cmin, min(cmax, hs)+1):
+            cs=hs-Lc
+            if cs<0: break
+            seg_h=h[cs:hs]; seg_l=l[cs:hs]               # cup span (left rim -> right rim, no handle)
+            if len(seg_l)<3 or np.isnan(seg_l).any(): continue
+            lrim=float(np.nanmax(seg_h[:3])); rrim=h_hi
+            cup_hi=max(lrim,rrim); cup_lo=float(np.nanmin(seg_l))
+            if cup_hi<=0 or cup_lo<=0: continue
+            depth=(cup_hi-cup_lo)/cup_hi
+            if depth<min_depth or depth>max_depth: continue
+            if not (0.88*lrim<=rrim<=1.08*lrim): continue        # rims roughly level
+            bottoff=int(np.argmin(seg_l))                        # U not V: bottom near the middle
+            if bottoff<0.25*Lc or bottoff>0.75*Lc: continue
+            if np.sum(seg_l<=cup_lo+0.20*depth*cup_hi)<max(0.30*Lc,4): continue   # broad, rounded base (rejects V)
+            mid=seg_l[int(0.30*Lc):int(0.70*Lc)+1]               # middle third must sit low (no sharp spike)
+            if len(mid)==0 or (float(np.nanmean(mid))-cup_lo)>0.35*depth*cup_hi: continue
+            if h_lo<cup_lo+0.5*depth*cup_hi: continue            # handle in the upper half of the cup
+            if h_depth>0.5*depth: continue                       # handle shallower than the cup
+            dry=float(np.nanmean(v[hs:end+1]))/vol50 if (_ok(vol50) and vol50>0) else 1.0
+            if dry>1.0: continue                                 # handle volume dry-up
+            contr=h_depth/depth
+            cand=dict(bk=Hf,piv=h_hi,blo=h_lo,tight=h_depth,contr=round(contr,2),dry=dry,
+                      type="CupHandle",depth=round(depth*100,1),note=f"cup {depth*100:.0f}%")
+            rank=(depth,1.0-contr,Lc/float(cmax))                # deeper cup, tighter handle, longer cup
+            if best is None or rank>best[0]: best=(rank,cand)
+            break                                                # first valid cup per handle, then next handle
+    return best[1] if best else None
+
+def darvas_box(A, end, c, vol50, conf=3, max_age=60, min_pct=0.03, max_pct=0.40):
+    """Darvas box (How I Made $2,000,000): a CEILING (a high not exceeded for `conf` bars) and
+    a FLOOR (a low not broken for `conf` bars) bound a consolidation box near the highs. Buy the
+    break above the ceiling. Pivot = box top, stop = box bottom. Returns a base dict or None."""
+    h=A['h']; l=A['l']; v=A['v']
+    ct=None
+    for j in range(end-conf, max(end-conf-max_age, conf), -1):           # most recent confirmed ceiling
+        if h[j]>=h[j-1] and all(h[j]>=h[j+k] for k in range(1,conf+1)):
+            ct=j; break
+    if ct is None: return None
+    box_top=float(h[ct]); cf=None
+    for j in range(ct+1, end-conf+1):                                    # floor after the ceiling
+        if all(l[j]<=l[j+k] for k in range(1,conf+1)):
+            cf=j; break
+    if cf is None: return None
+    box_bot=float(l[cf])
+    if box_bot<=0 or box_top<=box_bot: return None
+    box_pct=(box_top-box_bot)/box_bot
+    if box_pct<min_pct or box_pct>max_pct: return None
+    dry=float(np.nanmean(v[ct:end+1]))/vol50 if (_ok(vol50) and vol50>0) else 1.0
+    return dict(bk=int(max(end-ct,conf)),piv=box_top,blo=box_bot,tight=box_pct,
+                contr=round(min(box_pct/max_pct,1.0),2),dry=round(dry,2),
+                type="DarvasBox",note=f"box {box_pct*100:.0f}%")
+
+def pocket_pivot(A, end, c, vol50, max_ext=0.05, lookback=10):
+    """Pocket pivot (Morales / Kacher): an UP day whose volume exceeds the highest DOWN-day
+    volume of the prior `lookback` days, occurring near or through the 10-day MA in an uptrend.
+    An early in-base entry (buy today's close), NOT a pivot breakout. Entry = close, stop =
+    today's low. Returns a base dict or None."""
+    cl=A['c']; lo=A['l']; vv=A['v']
+    if end<lookback+1: return None
+    if cl[end]<=cl[end-1]: return None                                   # must be an up day
+    dv=[vv[j] for j in range(end-lookback, end) if cl[j]<cl[j-1]]
+    thr=max(dv) if dv else 0.0
+    if not (vv[end]>thr): return None                                    # volume signature
+    ma10=float(np.nanmean(cl[end-9:end+1]))
+    if ma10<=0: return None
+    if not ((lo[end]<=ma10<=c) or abs((c-ma10)/ma10)<=max_ext): return None   # near/through 10dma, not extended
+    dayrange=(c-float(lo[end]))/c if c>0 else 0
+    if dayrange<=0: return None
+    volratio=vv[end]/thr if thr>0 else 2.0
+    return dict(bk=1,piv=round(c,2),blo=round(float(lo[end]),2),tight=dayrange,contr=0.5,
+                dry=round((thr/vol50) if (_ok(vol50) and vol50>0) else 1.0,2),
+                type="PocketPivot",note=f"vol {volratio:.1f}x")
+
 def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
                 min_base=3, strictness="Strict", nifty_mom_ret=0.0,
                 low_dist_on=True, low_dist_min=30.0, low_dist_max=None,
                 wedge_on=False, wedge_slope_min=0.05, wedge_slope_max=0.80,
-                htf_on=False, htf_thrust_min=0.80, htf_flag_max=0.25):
+                htf_on=False, htf_thrust_min=0.80, htf_flag_max=0.25,
+                cup_on=False, cup_min_depth=0.12, cup_max_depth=0.40, cup_handle_max=0.15,
+                darvas_on=False, darvas_min_pct=0.03, darvas_max_pct=0.40,
+                pp_on=False, pp_max_ext=0.05):
     p=tf_params(timeframe); A=vcp_arrays(df,p); n=A['n']
     if n < max(p['mal'], p['win'])+5: return None
     i=n-1; c=A['c'][i]
@@ -192,7 +283,7 @@ def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
         bo=flat_base(A,i-1,c,max_tight,min_base,F,vol50)
         if bo and c>bo['piv'] and vol_surge>=2.5:           # 2.5x+ surge (backtest: 2.5-4x best)
             status,base="Breakout",bo
-    base_type="Flat"; slope=None; pole=None
+    base_type="Flat"; slope=None; pole=None; note=None
     # Fallbacks below ONLY run when the flat box found nothing, and only when toggled on.
     # They can only ADD candidates the flat detector missed; they never alter a flat result.
     if base is None and wedge_on:                           # --- sloping / converging wedge ---
@@ -215,12 +306,40 @@ def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
                 status,base="Breakout",hb
         if base is not None:
             base_type="HiTightFlag"; pole=base.get('pole')
+    if base is None and cup_on:                             # --- cup with handle ---
+        weekly=(timeframe=="Weekly")
+        hmn,hmx,cmn,cmx=(2,8,6,45) if weekly else (3,25,18,130)
+        cc=cup_handle(A,i,c,vol50,cup_min_depth,cup_max_depth,cup_handle_max,hmn,hmx,cmn,cmx)
+        if cc and c<=cc['piv']*1.001 and c>=cc['piv']*(1-0.06):
+            status,base="Coiling",cc
+        else:
+            cb=cup_handle(A,i-1,c,vol50,cup_min_depth,cup_max_depth,cup_handle_max,hmn,hmx,cmn,cmx)
+            if cb and c>cb['piv'] and vol_surge>=2.5:
+                status,base="Breakout",cb
+        if base is not None:
+            base_type="CupHandle"; note=base.get('note')
+    if base is None and darvas_on:                          # --- darvas box ---
+        dc=darvas_box(A,i,c,vol50,3,60,darvas_min_pct,darvas_max_pct)
+        if dc and c<=dc['piv']*1.001 and c>=dc['piv']*(1-0.06):
+            status,base="Coiling",dc
+        else:
+            db=darvas_box(A,i-1,c,vol50,3,60,darvas_min_pct,darvas_max_pct)
+            if db and c>db['piv'] and c<=db['piv']*1.04 and vol_surge>=2.5:   # fresh break, not extended
+                status,base="Breakout",db
+        if base is not None:
+            base_type="DarvasBox"; note=base.get('note')
+    if base is None and pp_on:                              # --- pocket pivot (early in-base entry) ---
+        pp=pocket_pivot(A,i,c,vol50,pp_max_ext)
+        if pp:
+            status,base="Breakout",pp                        # actionable today (buy the close)
+            base_type="PocketPivot"; note=pp.get('note')
     if base is None: return None
     mom=p['mom']; sret=(c/A['c'][i-mom]-1) if i-mom>=0 and A['c'][i-mom]>0 else 0.0
     rs=sret-(nifty_mom_ret or 0.0)
     # weights re-tuned from a 2,072-trade breakout backtest: proximity to 52w high,
     # relative strength, and a 2.5-4x breakout surge were the strongest return drivers.
-    tight_ref = htf_flag_max if base_type=="HiTightFlag" else max_tight
+    tight_ref = {"HiTightFlag":htf_flag_max, "CupHandle":cup_handle_max,
+                 "DarvasBox":darvas_max_pct}.get(base_type, max_tight)
     s_tight=14*max(0,1-base['tight']/tight_ref)
     s_contr=12*float(np.clip(1-base['contr'],0,1))
     s_dry  =10*float(np.clip((1-base['dry'])/0.5,0,1))
@@ -240,7 +359,7 @@ def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
         rs=round(rs*100,1), pivot=round(base['piv'],2),
         stop=round(base['blo'],2), dist_pivot=round((base['piv']-c)/c*100,2),
         vol_surge=round(vol_surge,2), target=round(c+2*(c-base['blo']),2),
-        base_type=base_type, slope=slope, pole=pole,
+        base_type=base_type, slope=slope, pole=pole, note=note,
         date=str(df['date'].iloc[i].date()))
 
 def nifty_mom(timeframe="Daily", fetch_fn=None, nifty_row=None):
@@ -273,9 +392,12 @@ def build_vcp_html(rows, scanned, failed, timeframe="Daily", summary=""):
         g=r['grade']; st_="Breakout" if r['status']=="Breakout" else "Coiling"
         stcss="bk" if r['status']=="Breakout" else "co"
         ld_=f"{r['low_dist']}%" if r.get('low_dist') is not None else "&mdash;"
-        bt_=r.get('base_type','Flat'); btcss={"Ascending":"asc","Descending":"desc","HiTightFlag":"htf"}.get(bt_,"flat")
+        bt_=r.get('base_type','Flat')
+        btcss={"Ascending":"asc","Descending":"desc","HiTightFlag":"htf",
+               "CupHandle":"cup","DarvasBox":"dvb","PocketPivot":"pp"}.get(bt_,"flat")
         if bt_=="HiTightFlag" and r.get('pole') is not None: sl_=f"+{r['pole']:.0f}% pole"
         elif r.get('slope') is not None: sl_=f"{r['slope']:+.2f}%/bar"
+        elif r.get('note'): sl_=r['note']
         else: sl_="&mdash;"
         trs+=(f"<tr><td><span class='grade' style='background:{gcol.get(g,'#445')}'>{g}</span></td>"
               f"<td><span class='stt {stcss}'>{st_}</span></td>"
@@ -310,6 +432,8 @@ th{{background:var(--panel);font-size:13px;text-transform:uppercase;color:var(--
 .bt{{font-weight:800;padding:3px 9px;border-radius:7px;font-size:14px}}
 .bt.flat{{background:#eef2f8;color:#3a4654}}.bt.asc{{background:#e7f6ea;color:#1b7a2f}}
 .bt.desc{{background:#fff4e0;color:#8a6d00}}.bt.htf{{background:#fdeaea;color:#b3261e}}
+.bt.cup{{background:#eeedfe;color:#3c3489}}.bt.dvb{{background:#e1f5ee;color:#0f6e56}}
+.bt.pp{{background:#fbeaf0;color:#993556}}
 .empty{{padding:22px;background:var(--panel);border:1px dashed var(--line);border-radius:12px;color:var(--mut)}}
 .foot{{margin-top:28px;font-size:15px;color:var(--mut);background:var(--panel);border:1px solid var(--line);
 border-radius:12px;padding:16px 18px}}</style></head><body><div class="wrap">
@@ -320,7 +444,10 @@ border-radius:12px;padding:16px 18px}}</style></head><body><div class="wrap">
 cleared the pivot on a volume surge (TARIL-type). <b>Type</b>: <b>Flat</b> = horizontal tight box;
 <b>Ascending</b> = higher lows on a rising support trendline (accumulation); <b>Descending</b> = falling
 resistance over holding lows, coiling into the apex; <b>HiTightFlag</b> = a tight shallow flag atop a recent
-powerful pole (the Slope/Pole column shows the pole gain %). <b>Slope</b> = trendline slope in %/bar (Flat = &mdash;).
+powerful pole (the Slope/Pole column shows the pole gain %); <b>CupHandle</b> = a rounded U base + small
+upper-half handle (column shows cup depth); <b>DarvasBox</b> = a confirmed ceiling/floor box (column shows
+box %); <b>PocketPivot</b> = an early in-base entry on an up-day whose volume tops the prior 10 down-days
+(column shows the volume ratio; buy the day's close, not a pivot breakout). <b>Slope</b> = trendline slope in %/bar (Flat = &mdash;).
 Tight = base span %; Dry = base volume vs 50-bar avg (lower = quieter base); Contr = recent vs earlier range
 (lower = contracting); enter on a move through the Pivot, stop at base low. Grade reflects base quality;
 Ascending/Descending grades are heuristic and not yet backtested. Research tool, not investment advice.</div>
@@ -331,7 +458,10 @@ def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
                    progress=None, request_delay=0.0, nifty_ret=0.0,
                    low_dist_on=True, low_dist_min=30.0, low_dist_max=None,
                    wedge_on=False, wedge_slope_min=0.05, wedge_slope_max=0.80,
-                   htf_on=False, htf_thrust_min=0.80, htf_flag_max=0.25):
+                   htf_on=False, htf_thrust_min=0.80, htf_flag_max=0.25,
+                   cup_on=False, cup_min_depth=0.12, cup_max_depth=0.40, cup_handle_max=0.15,
+                   darvas_on=False, darvas_min_pct=0.03, darvas_max_pct=0.40,
+                   pp_on=False, pp_max_ext=0.05):
     fetch_fn = fetch_fn or (lambda row: sc.fetch_ohlcv(row["yahoo"]))
     out=[]; scanned=0; failed=[]; total=len(rows); done=0
     def work(r):
@@ -347,7 +477,10 @@ def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
                 try: m=analyze_vcp(df,r,timeframe,near_high_pct,max_tight,min_base,strictness,nifty_ret,
                                    low_dist_on,low_dist_min,low_dist_max,
                                    wedge_on,wedge_slope_min,wedge_slope_max,
-                                   htf_on,htf_thrust_min,htf_flag_max)
+                                   htf_on,htf_thrust_min,htf_flag_max,
+                                   cup_on,cup_min_depth,cup_max_depth,cup_handle_max,
+                                   darvas_on,darvas_min_pct,darvas_max_pct,
+                                   pp_on,pp_max_ext)
                 except Exception: m=None
                 if m: out.append(m)
             if progress: progress(done,total,r["symbol"])

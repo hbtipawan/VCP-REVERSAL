@@ -254,7 +254,8 @@ def vcp_columns():
          "v":lambda r:(r.get('pole') if r.get('base_type')=='HiTightFlag' and r.get('pole') is not None
                        else (r.get('slope') if r.get('slope') is not None else 0)),
          "c":lambda r:(f"+{r['pole']:.0f}% pole" if r.get('base_type')=='HiTightFlag' and r.get('pole') is not None
-                       else (f"{r['slope']:+.2f}/bar" if r.get('slope') is not None else "&mdash;"))},
+                       else (f"{r['slope']:+.2f}/bar" if r.get('slope') is not None
+                       else (r['note'] if r.get('note') else "&mdash;")))},
         {"label":"Symbol","type":"text","cls":"l","v":lambda r:r['symbol'],"c":_sym_cell},
         {"label":"Close","type":"num","v":lambda r:r['close'],"c":lambda r:f"{r['close']}"},
         {"label":"Tight","type":"num","v":lambda r:r['tightness'],"c":lambda r:f"{r['tightness']}%"},
@@ -412,6 +413,9 @@ near_high = 25; max_tight = 5; min_base = 3; strictness = "Strict"; min_grade = 
 low_on = True; low_min = 30.0; low_max = None
 wedge_on = False; wedge_lo = 0.05; wedge_hi = 0.80; base_f = "All"
 htf_on = False; htf_thrust = 80; htf_flag = 25
+cup_on = False; cup_dmin = 12; cup_dmax = 40; cup_hmax = 15
+darvas_on = False; darvas_dmin = 3; darvas_dmax = 40
+pp_on = False; pp_ext = 5
 if scanner == "Reversal patterns":
     scan_n  = st.sidebar.slider("Scan signals from last N bars", 1, 3, 1)
     vol_only = st.sidebar.checkbox("Show volume-confirmed signals only", value=False)
@@ -454,9 +458,29 @@ else:
                 help="How far price must have run up over ~9 weeks before the flag. Classic HTF \u2248 90\u2013100%+.")
         htf_flag = st.sidebar.slider("Max flag depth (%)", 5, 35, 25, step=1,
                 help="Maximum high-to-low retrace inside the flag. Tighter (lower) = higher quality.")
-    base_f = st.sidebar.selectbox("Base type", ["All", "Flat", "Ascending", "Descending", "HiTightFlag"], index=0,
-                help="Filter results by base shape. (Ascending/Descending need the wedge toggle; "
-                     "HiTightFlag needs the High Tight Flag toggle.)")
+    cup_on = st.sidebar.checkbox("Also find Cup-with-Handle", value=False,
+                help="O'Neil/Minervini rounded U base + small upper-half handle on dry volume. "
+                     "Buy above the handle high. Runs only when the above find nothing.")
+    if cup_on:
+        cup_dmin, cup_dmax = st.sidebar.slider("Cup depth (% from rim)", 8, 60, (12, 40), step=1,
+                help="Allowed cup depth. O'Neil's classic range is ~12\u201333%; deeper cups are weaker.")
+        cup_hmax = st.sidebar.slider("Max handle depth (%)", 5, 25, 15, step=1,
+                help="Handle must be shallow and sit in the cup's upper half. Tighter is stronger.")
+    darvas_on = st.sidebar.checkbox("Also find Darvas Boxes", value=False,
+                help="A confirmed ceiling (high not exceeded for 3 bars) + floor (low not broken for 3 bars). "
+                     "Buy the break above the box top. Allows wider boxes than the flat detector.")
+    if darvas_on:
+        darvas_dmin, darvas_dmax = st.sidebar.slider("Box height (%)", 2, 60, (3, 40), step=1,
+                help="Allowed box height (top vs bottom). Too narrow = noise; too wide = loose.")
+    pp_on = st.sidebar.checkbox("Also find Pocket Pivots", value=False,
+                help="Morales/Kacher early in-base entry: an up-day whose volume tops the highest down-day "
+                     "volume of the prior 10 days, near/through the 10dma. Buy the day's close (not a breakout).")
+    if pp_on:
+        pp_ext = st.sidebar.slider("Max extension above 10dma (%)", 1, 12, 5, step=1,
+                help="Skip pivots too far above the 10-day MA (extended). Lower = stricter, earlier entries.")
+    base_f = st.sidebar.selectbox("Base type",
+                ["All", "Flat", "Ascending", "Descending", "HiTightFlag", "CupHandle", "DarvasBox", "PocketPivot"],
+                index=0, help="Filter results by base shape. Each non-Flat type needs its own toggle enabled above.")
 
 dft_workers = 5 if source == "Dhan" else 8
 workers = st.sidebar.slider("Fetch threads", 1, 16, dft_workers,
@@ -562,7 +586,11 @@ if run:
                                             progress=prog, request_delay=req_delay, nifty_ret=nret,
                                             low_dist_on=low_on, low_dist_min=low_min, low_dist_max=low_max,
                                             wedge_on=wedge_on, wedge_slope_min=wedge_lo, wedge_slope_max=wedge_hi,
-                                            htf_on=htf_on, htf_thrust_min=htf_thrust/100, htf_flag_max=htf_flag/100)
+                                            htf_on=htf_on, htf_thrust_min=htf_thrust/100, htf_flag_max=htf_flag/100,
+                                            cup_on=cup_on, cup_min_depth=cup_dmin/100, cup_max_depth=cup_dmax/100,
+                                            cup_handle_max=cup_hmax/100,
+                                            darvas_on=darvas_on, darvas_min_pct=darvas_dmin/100, darvas_max_pct=darvas_dmax/100,
+                                            pp_on=pp_on, pp_max_ext=pp_ext/100)
             except PermissionError as e:
                 bar.empty(); st.error(str(e)); st.stop()
         bar.empty()
