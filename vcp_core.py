@@ -19,14 +19,15 @@ import screener_core as sc   # reuse fetch_ohlcv + tv_url
 
 def tf_params(timeframe):
     if timeframe == "Weekly":
-        return dict(maf=10, mam=30, mal=40, win=52, mom=26, funnel=15, rng="5y")
-    return dict(maf=50, mam=150, mal=200, win=252, mom=126, funnel=30, rng="2y")
+        return dict(maf=10, mam=30, mal=40, win=52, mom=26, funnel=15, rng="5y", epw=13)
+    return dict(maf=50, mam=150, mal=200, win=252, mom=126, funnel=30, rng="2y", epw=65)
 
 def vcp_arrays(df, p):
     c=df['close'].values.astype(float); h=df['high'].values.astype(float)
     l=df['low'].values.astype(float);  v=df['volume'].values.astype(float)
+    o=df['open'].values.astype(float) if 'open' in df else c.copy()
     sma=lambda x,n: pd.Series(x).rolling(n).mean().values
-    return dict(c=c,h=h,l=l,v=v, maf=sma(c,p['maf']), mam=sma(c,p['mam']),
+    return dict(c=c,h=h,l=l,v=v,o=o, maf=sma(c,p['maf']), mam=sma(c,p['mam']),
         mal=sma(c,p['mal']), vol50=sma(v,50), n=len(c))
 
 def _ok(x): return x is not None and not (isinstance(x,float) and np.isnan(x))
@@ -244,6 +245,42 @@ def pocket_pivot(A, end, c, vol50, max_ext=0.05, lookback=10):
                 dry=round((thr/vol50) if (_ok(vol50) and vol50>0) else 1.0,2),
                 type="PocketPivot",note=f"vol {volratio:.1f}x")
 
+def episodic_pivot(A, end, vol50, move_min=0.10, gap_min=0.05, vol_min=3.0,
+                   dorm_win=65, dorm_max=0.30, vol_lookback=10):
+    """Episodic Pivot (Bonde / Qullamaggie): a large catalyst-driven gap-up / surge on massive
+    volume, OUT OF a stock that has been dormant (flat, not rallied) for months, closing strong.
+    OHLCV footprint only -- the catalyst (earnings / news) must be confirmed by the user.
+    Entry = break of the event-day HIGH; stop = the event-day LOW. Returns a dict or None."""
+    o=A['o']; cl=A['c']; hi=A['h']; lo=A['l']; vv=A['v']
+    if end < dorm_win+5: return None
+    pc=cl[end-1]
+    if pc<=0 or not (_ok(vol50) and vol50>0): return None
+    c=cl[end]; H=float(hi[end]); L=float(lo[end])
+    move=c/pc-1.0                                   # close-to-close surge
+    gap =o[end]/pc-1.0                               # opening gap
+    volr=vv[end]/vol50                               # volume vs 50-day average
+    rng=H-L
+    if rng<=0 or c<=0: return None
+    close_pos=(c-L)/rng                              # where it closed in the day's range
+    # --- the episode: a big up day, on massive volume, closing strong ---
+    if move < move_min: return None
+    if volr < vol_min: return None
+    if close_pos < 0.5: return None                  # must close in the upper half (held the move)
+    if gap < gap_min and move < move_min*1.5: return None   # a real gap, or an exceptionally large surge
+    if vv[end] < np.nanmax(vv[end-vol_lookback:end]):       # volume must be a genuine expansion (recent high)
+        return None
+    # --- dormancy: the stock must NOT have already rallied into the event (flat for months) ---
+    base0=cl[end-1-dorm_win]
+    pre_run=(pc/base0-1.0) if base0>0 else 0.0
+    if pre_run > dorm_max: return None               # already ran up -> not a fresh episodic pivot
+    pre_adr=float(np.nanmean((hi[end-dorm_win:end]-lo[end-dorm_win:end])/
+                             np.where(cl[end-dorm_win:end]>0, cl[end-dorm_win:end], np.nan)))
+    return dict(type="EpisodicPivot", piv=round(H,2), blo=round(L,2), bk=dorm_win,
+                tight=rng/c, contr=pre_run, dry=pre_adr, gap=gap, move=move, volr=volr,
+                close_pos=close_pos,
+                note=(f"gap +{gap*100:.0f}% \u00b7 +{move*100:.0f}% \u00b7 {volr:.1f}x vol"
+                      if gap>=0.01 else f"+{move*100:.0f}% \u00b7 {volr:.1f}x vol"))
+
 def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
                 min_base=3, strictness="Strict", nifty_mom_ret=0.0,
                 low_dist_on=True, low_dist_min=30.0, low_dist_max=None,
@@ -251,12 +288,39 @@ def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
                 htf_on=False, htf_thrust_min=0.80, htf_flag_max=0.25,
                 cup_on=False, cup_min_depth=0.12, cup_max_depth=0.40, cup_handle_max=0.15,
                 darvas_on=False, darvas_min_pct=0.03, darvas_max_pct=0.40,
-                pp_on=False, pp_max_ext=0.05):
+                pp_on=False, pp_max_ext=0.05,
+                ep_on=False, ep_move_min=0.10, ep_gap_min=0.05, ep_vol_min=3.0, ep_dorm_max=0.30):
     p=tf_params(timeframe); A=vcp_arrays(df,p); n=A['n']
     if n < max(p['mal'], p['win'])+5: return None
     i=n-1; c=A['c'][i]
     maf,mam,mal=A['maf'][i],A['mam'][i],A['mal'][i]
     if not all(_ok(x) for x in (c,maf,mam,mal)) or c<=0: return None
+    # --- Episodic Pivot: an INDEPENDENT path that runs ONLY when ep_on. EPs erupt from dormant
+    # stocks (often below their MAs / far from the highs), so they deliberately bypass the
+    # Stage-2 trend and near-high gates below. With ep_on=False this whole block is skipped,
+    # so the base-pattern logic that follows is completely unchanged. ---
+    if ep_on:
+        ep=episodic_pivot(A,i,A['vol50'][i],ep_move_min,ep_gap_min,ep_vol_min,p['epw'],ep_dorm_max)
+        if ep:
+            hi52e=np.nanmax(A['h'][i-p['win']+1:i+1]); lo52e=np.nanmin(A['l'][i-p['win']+1:i+1])
+            nh_e=(hi52e-c)/hi52e if hi52e>0 else 0.0
+            dl_e=(c/lo52e-1.0)*100.0 if (_ok(lo52e) and lo52e>0) else None
+            mom=p['mom']; sret=(c/A['c'][i-mom]-1) if i-mom>=0 and A['c'][i-mom]>0 else 0.0
+            rs_e=sret-(nifty_mom_ret or 0.0)
+            sc=round(25*float(np.clip(ep['move']/0.20,0,1)) + 25*float(np.clip(ep['volr']/6.0,0,1))
+                     + 15*float(np.clip(max(ep['gap'],0)/0.12,0,1))
+                     + 15*float(np.clip(1-ep['contr']/max(ep_dorm_max,1e-9),0,1))
+                     + 20*float(np.clip(ep['close_pos'],0,1)))
+            gr="A" if sc>=75 else "B" if sc>=60 else "C"
+            return dict(symbol=row['symbol'], name=row.get('name',''), exch=row.get('exch',''),
+                sector=row.get('sector',''), close=round(c,2), status="Breakout", grade=gr, score=sc,
+                base_len=int(ep['bk']), tightness=round(ep['tight']*100,1),
+                contraction=round(ep['contr'],2), dryup=round(ep['dry'],2),
+                near_high=round(nh_e*100,1), low_dist=(round(dl_e,1) if dl_e is not None else None),
+                rs=round(rs_e*100,1), pivot=ep['piv'], stop=ep['blo'],
+                dist_pivot=round((ep['piv']-c)/c*100,2), vol_surge=round(ep['volr'],2),
+                target=round(c+2*(c-ep['blo']),2), base_type="EpisodicPivot",
+                slope=None, pole=None, note=ep['note'], date=str(df['date'].iloc[i].date()))
     # --- trend template gates (Relaxed / Standard / Strict). Strict = textbook Stage 2 ---
     maf_rising = maf > A['maf'][i-10]
     mal_rising = mal > A['mal'][i-20]
@@ -394,7 +458,8 @@ def build_vcp_html(rows, scanned, failed, timeframe="Daily", summary=""):
         ld_=f"{r['low_dist']}%" if r.get('low_dist') is not None else "&mdash;"
         bt_=r.get('base_type','Flat')
         btcss={"Ascending":"asc","Descending":"desc","HiTightFlag":"htf",
-               "CupHandle":"cup","DarvasBox":"dvb","PocketPivot":"pp"}.get(bt_,"flat")
+               "CupHandle":"cup","DarvasBox":"dvb","PocketPivot":"pp",
+               "EpisodicPivot":"ep"}.get(bt_,"flat")
         if bt_=="HiTightFlag" and r.get('pole') is not None: sl_=f"+{r['pole']:.0f}% pole"
         elif r.get('slope') is not None: sl_=f"{r['slope']:+.2f}%/bar"
         elif r.get('note'): sl_=r['note']
@@ -434,6 +499,7 @@ th{{background:var(--panel);font-size:13px;text-transform:uppercase;color:var(--
 .bt.desc{{background:#fff4e0;color:#8a6d00}}.bt.htf{{background:#fdeaea;color:#b3261e}}
 .bt.cup{{background:#eeedfe;color:#3c3489}}.bt.dvb{{background:#e1f5ee;color:#0f6e56}}
 .bt.pp{{background:#fbeaf0;color:#993556}}
+.bt.ep{{background:#fff3cd;color:#7a4f00}}
 .empty{{padding:22px;background:var(--panel);border:1px dashed var(--line);border-radius:12px;color:var(--mut)}}
 .foot{{margin-top:28px;font-size:15px;color:var(--mut);background:var(--panel);border:1px solid var(--line);
 border-radius:12px;padding:16px 18px}}</style></head><body><div class="wrap">
@@ -447,7 +513,10 @@ resistance over holding lows, coiling into the apex; <b>HiTightFlag</b> = a tigh
 powerful pole (the Slope/Pole column shows the pole gain %); <b>CupHandle</b> = a rounded U base + small
 upper-half handle (column shows cup depth); <b>DarvasBox</b> = a confirmed ceiling/floor box (column shows
 box %); <b>PocketPivot</b> = an early in-base entry on an up-day whose volume tops the prior 10 down-days
-(column shows the volume ratio; buy the day's close, not a pivot breakout). <b>Slope</b> = trendline slope in %/bar (Flat = &mdash;).
+(column shows the volume ratio; buy the day's close, not a pivot breakout);
+<b>EpisodicPivot</b> = a large catalyst-driven gap/surge on massive volume out of a months-long dormant base
+(column shows gap %, move % and volume; confirm the earnings/news catalyst yourself, buy the break of the
+event-day high, stop at the event-day low). <b>Slope</b> = trendline slope in %/bar (Flat = &mdash;).
 Tight = base span %; Dry = base volume vs 50-bar avg (lower = quieter base); Contr = recent vs earlier range
 (lower = contracting); enter on a move through the Pivot, stop at base low. Grade reflects base quality;
 Ascending/Descending grades are heuristic and not yet backtested. Research tool, not investment advice.</div>
@@ -461,7 +530,8 @@ def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
                    htf_on=False, htf_thrust_min=0.80, htf_flag_max=0.25,
                    cup_on=False, cup_min_depth=0.12, cup_max_depth=0.40, cup_handle_max=0.15,
                    darvas_on=False, darvas_min_pct=0.03, darvas_max_pct=0.40,
-                   pp_on=False, pp_max_ext=0.05):
+                   pp_on=False, pp_max_ext=0.05,
+                   ep_on=False, ep_move_min=0.10, ep_gap_min=0.05, ep_vol_min=3.0, ep_dorm_max=0.30):
     fetch_fn = fetch_fn or (lambda row: sc.fetch_ohlcv(row["yahoo"]))
     out=[]; scanned=0; failed=[]; total=len(rows); done=0
     def work(r):
@@ -480,7 +550,8 @@ def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
                                    htf_on,htf_thrust_min,htf_flag_max,
                                    cup_on,cup_min_depth,cup_max_depth,cup_handle_max,
                                    darvas_on,darvas_min_pct,darvas_max_pct,
-                                   pp_on,pp_max_ext)
+                                   pp_on,pp_max_ext,
+                                   ep_on,ep_move_min,ep_gap_min,ep_vol_min,ep_dorm_max)
                 except Exception: m=None
                 if m: out.append(m)
             if progress: progress(done,total,r["symbol"])

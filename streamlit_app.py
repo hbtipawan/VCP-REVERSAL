@@ -13,7 +13,7 @@ Run:    streamlit run streamlit_app.py
 Deploy: push this + screener_core.py + vcp_core.py + dhan_data.py + EQUITY_L_2.csv
         + bse_stocks.csv + requirements.txt to GitHub, then deploy on share.streamlit.io.
 """
-import os, threading, datetime as dt
+import os, threading, datetime as dt, io, re
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -93,6 +93,66 @@ def get_list(kind):
         raw = pd.read_csv(up)
         return parse_nse(raw) if kind == "NSE" else parse_bse(raw)
     return None
+
+def _clean_sym(v):
+    """Normalise one cell into a bare ticker, or '' if it isn't one."""
+    s = str(v).strip().upper()
+    if not s or s in ("NAN", "SYMBOL", "TICKER", "NAME", "CODE", "SCRIP", "SCRIPCODE", "STOCK",
+                      "STOCKS", "COMPANY", "COMPANYID", "SECURITY", "ISIN", "SERIES", "EXCHANGE",
+                      "SECTOR", "INDUSTRY", "TRADINGSYMBOL", "NSESYMBOL"):
+        return ""
+    for suf in (".NS", ".BO", ".NSE", ".BSE"):
+        if s.endswith(suf): s = s[:-len(suf)]
+    return s.strip()
+
+def parse_symbol_upload(file, exch_default):
+    """Robustly read an uploaded CSV/TXT of stock symbols. Detects a symbol column by name,
+    else uses the first column; falls back to whitespace/comma-split for header-less lists.
+    Returns a list of {symbol,name,sector,exch} dicts (deduped, order preserved)."""
+    raw = file.getvalue()
+    txt = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    out = []
+    parsed = False
+    try:
+        df = pd.read_csv(io.StringIO(txt))
+        if len(df.columns) >= 1 and len(df) >= 1:
+            cols = {str(c).lower().strip(): c for c in df.columns}
+            keys = ("symbol", "ticker", "companyid", "sc_name", "scrip", "scripcode",
+                    "code", "nse symbol", "nsesymbol", "yahoo", "tradingsymbol", "name")
+            matched = [cols[k] for k in keys if k in cols]
+            if matched:
+                pick = matched[0]
+            elif len(df.columns) == 1:
+                # no recognised header on a single column -> the 'header' is really the first symbol;
+                # re-read with no header so that line becomes data too
+                df = pd.read_csv(io.StringIO(txt), header=None)
+                pick = df.columns[0]
+            else:
+                pick = df.columns[0]
+            seccol = next((cols[k] for k in ("sector", "industry") if k in cols), None)
+            exccol = next((cols[k] for k in ("exch", "exchange") if k in cols), None)
+            col_vals = df[pick].astype(str).tolist()
+            sec_vals = df[seccol].astype(str).tolist() if seccol else None
+            exc_vals = df[exccol].astype(str).tolist() if exccol else None
+            for j, val in enumerate(col_vals):
+                s = _clean_sym(val)
+                if not s: continue
+                ex = (exc_vals[j].upper().strip() if exc_vals else exch_default)
+                ex = ex if ex in ("NSE", "BSE") else exch_default
+                out.append((s, (sec_vals[j] if sec_vals else ""), ex))
+            parsed = True
+    except Exception:
+        parsed = False
+    if not parsed:                                   # header-less list: split on space/comma/semicolon/newline
+        for tok in re.split(r"[\s,;]+", txt):
+            s = _clean_sym(tok)
+            if s: out.append((s, "", exch_default))
+    seen, rows = set(), []
+    for s, sec, ex in out:
+        if (s, ex) in seen: continue
+        seen.add((s, ex))
+        rows.append({"symbol": s, "name": s, "sector": (sec if sec and sec != "nan" else ""), "exch": ex})
+    return rows
 
 @st.cache_data(show_spinner="Loading Dhan instrument master...", ttl=24*3600)
 def dhan_maps():
@@ -337,13 +397,46 @@ if source == "Dhan":
 exch = st.sidebar.radio("Exchange", ["NSE", "BSE", "Both"], index=0)
 timeframe = st.sidebar.radio("Timeframe", ["Daily", "Weekly"], index=0)
 
+use_upload = st.sidebar.checkbox("Search only within my uploaded stock list", value=False,
+                    help="Scan ONLY the symbols in a CSV/TXT you upload (overrides the bundled list and the "
+                         "full-universe option). Toggle off to go back to the normal list.")
+up_file = None
+if use_upload:
+    up_file = st.sidebar.file_uploader("Upload symbols (CSV with a 'Symbol' column, or one per line)",
+                                       type=["csv", "txt"], key="symbol_universe")
+    if up_file is None:
+        st.sidebar.warning("Upload a file to activate — using the normal list until you do.")
+
 full_universe = st.sidebar.checkbox("Scan entire NSE/BSE universe (ignore my list)", value=False,
                     help="Screens every cash-equity on the selected exchange(s) straight from the "
                          "data source, instead of your uploaded CSVs.")
 
 unmapped = []
 cap_note = None
-if full_universe:
+if use_upload and up_file is not None:
+    rows_up = parse_symbol_upload(up_file, "BSE" if exch == "BSE" else "NSE")
+    if not rows_up:
+        st.title("Bullish Scanners")
+        st.error("No stock symbols found in that file. Use a CSV with a **Symbol** column "
+                 "(Ticker / companyId / NSE Symbol also work), or a plain list with one symbol per line.")
+        st.stop()
+    uni = pd.DataFrame(rows_up)
+    if source == "Dhan":
+        try:
+            nse_map, bse_map = dhan_maps()
+            uni, unmapped = dd.map_universe(uni, nse_map, bse_map)
+        except Exception as e:
+            st.title("Bullish Scanners"); st.error(f"Could not load the Dhan instrument master: {e}"); st.stop()
+    elif source == "Upstox":
+        try:
+            nse_map, bse_map = upstox_maps()
+            uni, unmapped = ud.map_universe(uni, nse_map, bse_map)
+        except Exception as e:
+            st.title("Bullish Scanners"); st.error(f"Could not load Upstox instruments: {e}"); st.stop()
+    if "yahoo" not in uni.columns:
+        uni["yahoo"] = uni.apply(lambda r: r["symbol"] + (".NS" if r["exch"] == "NSE" else ".BO"), axis=1)
+    cap_note = f"your uploaded list ({len(uni)} mapped)"
+elif full_universe:
     try:
         if source == "Dhan":
             uni = dd.full_universe(exch, dd.load_scrip_master())
@@ -396,8 +489,10 @@ if sectors:
         uni = uni[uni["sector"].isin(chosen)]
 
 st.sidebar.markdown(f"**{len(uni)}** stocks "
-                    + ("in the full universe" if full_universe else "match")
-                    + (f" ({len(unmapped)} not listed, skipped)" if (not full_universe and source in ("Dhan","Upstox") and unmapped) else ""))
+                    + ("from your uploaded list" if (use_upload and up_file is not None)
+                       else "in the full universe" if full_universe else "match")
+                    + (f" ({len(unmapped)} not listed, skipped)"
+                       if (not full_universe and source in ("Dhan","Upstox") and unmapped) else ""))
 total_uni = len(uni)
 scan_all = st.sidebar.checkbox("Scan ALL matching stocks (no limit)", value=False,
             help="Scans every matching stock. Large scans auto-throttle and cache for the day.")
@@ -416,6 +511,7 @@ htf_on = False; htf_thrust = 80; htf_flag = 25
 cup_on = False; cup_dmin = 12; cup_dmax = 40; cup_hmax = 15
 darvas_on = False; darvas_dmin = 3; darvas_dmax = 40
 pp_on = False; pp_ext = 5
+ep_on = False; ep_move = 10; ep_gap = 5; ep_vol = 3.0; ep_dorm = 30
 if scanner == "Reversal patterns":
     scan_n  = st.sidebar.slider("Scan signals from last N bars", 1, 3, 1)
     vol_only = st.sidebar.checkbox("Show volume-confirmed signals only", value=False)
@@ -478,8 +574,23 @@ else:
     if pp_on:
         pp_ext = st.sidebar.slider("Max extension above 10dma (%)", 1, 12, 5, step=1,
                 help="Skip pivots too far above the 10-day MA (extended). Lower = stricter, earlier entries.")
+    ep_on = st.sidebar.checkbox("Also find Episodic Pivots (Bonde / Qullamaggie)", value=False,
+                help="A catalyst-driven gap/surge on massive volume out of a months-long DORMANT base. "
+                     "Independent of the base-pattern gates (EPs come from stocks below their MAs / far from "
+                     "highs). Confirm the earnings/news catalyst yourself; buy the break of the event-day high.")
+    if ep_on:
+        ep_move = st.sidebar.slider("Min day move (%)", 4, 25, 10, step=1,
+                help="Close-to-close surge on the event day. Qullamaggie's classic EP is a 10%+ gap; lower it "
+                     "to ~5-6% to catch more NSE mid/small-cap EPs.")
+        ep_gap = st.sidebar.slider("Min opening gap (%)", 0, 20, 5, step=1,
+                help="The opening gap vs the prior close. 0 also allows strong intraday-ramp EPs (no gap).")
+        ep_vol = st.sidebar.slider("Min volume vs 50-day avg (x)", 1.5, 10.0, 3.0, step=0.5,
+                help="Volume explosion on the event day. Must also be the highest in the prior 10 sessions.")
+        ep_dorm = st.sidebar.slider("Max prior run before the event (%)", 5, 80, 30, step=5,
+                help="The stock must NOT have rallied into the event. Caps the gain over the prior ~3 months "
+                     "(quarter). Lower = stricter 'dormant base' requirement (the best EPs are flat for 3-6 months).")
     base_f = st.sidebar.selectbox("Base type",
-                ["All", "Flat", "Ascending", "Descending", "HiTightFlag", "CupHandle", "DarvasBox", "PocketPivot"],
+                ["All", "Flat", "Ascending", "Descending", "HiTightFlag", "CupHandle", "DarvasBox", "PocketPivot", "EpisodicPivot"],
                 index=0, help="Filter results by base shape. Each non-Flat type needs its own toggle enabled above.")
 
 dft_workers = 5 if source == "Dhan" else 8
@@ -590,7 +701,9 @@ if run:
                                             cup_on=cup_on, cup_min_depth=cup_dmin/100, cup_max_depth=cup_dmax/100,
                                             cup_handle_max=cup_hmax/100,
                                             darvas_on=darvas_on, darvas_min_pct=darvas_dmin/100, darvas_max_pct=darvas_dmax/100,
-                                            pp_on=pp_on, pp_max_ext=pp_ext/100)
+                                            pp_on=pp_on, pp_max_ext=pp_ext/100,
+                                            ep_on=ep_on, ep_move_min=ep_move/100, ep_gap_min=ep_gap/100,
+                                            ep_vol_min=ep_vol, ep_dorm_max=ep_dorm/100)
             except PermissionError as e:
                 bar.empty(); st.error(str(e)); st.stop()
         bar.empty()
