@@ -13,7 +13,7 @@ Run:    streamlit run streamlit_app.py
 Deploy: push this + screener_core.py + vcp_core.py + dhan_data.py + EQUITY_L_2.csv
         + bse_stocks.csv + requirements.txt to GitHub, then deploy on share.streamlit.io.
 """
-import os, threading, datetime as dt, io, re
+import os, threading, datetime as dt, io, re, urllib.parse
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -21,6 +21,7 @@ import screener_core as sc
 import vcp_core as vc
 import dhan_data as dd
 import upstox_data as ud
+import kite_data as kd
 import marketcap as mcap
 
 st.set_page_config(page_title="Bullish Scanners", layout="wide", page_icon=":chart_with_upwards_trend:")
@@ -162,6 +163,16 @@ def dhan_maps():
 def upstox_maps():
     return ud.build_symbol_maps()
 
+@st.cache_data(show_spinner="Loading Kite instrument list...", ttl=24*3600)
+def kite_maps():
+    return kd.build_symbol_maps()
+
+@st.cache_data(show_spinner="Logging in to Kite (TOTP)...", ttl=8*3600)
+def get_kite_auto_token(api_key, api_secret, user_id, password, totp_secret, daystamp):
+    """Generate + cache a fresh Kite access-token via TOTP. daystamp forces one
+    regeneration per day. Returns the token string; raises on failure."""
+    return kd.auto_login(api_key, api_secret, user_id, password, totp_secret)
+
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def market_caps(pairs, daystamp):
     return mcap.get_marketcaps([tuple(p) for p in pairs])
@@ -178,11 +189,13 @@ def get_dhan_auto_token(client_id, pin, totp_secret, daystamp):
 def _fetch_cache():
     return {}, threading.Lock()
 
-def make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, token, client, daystamp):
+def make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, token, client, daystamp,
+               kite_at=None, kite_key=None):
     cache, lock = _fetch_cache()
     def f(row):
         rid = (row.get("security_id") if source == "Dhan"
                else row.get("instrument_key") if source == "Upstox"
+               else row.get("instrument_token") if source == "Kite"
                else row.get("yahoo"))
         key = (source, rid, weekly, daystamp)
         with lock:
@@ -197,6 +210,11 @@ def make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, token, client, 
             to_d = dt.date.today(); from_d = to_d - dt.timedelta(days=int(years*365)+15)
             df = ud.fetch_daily(row["instrument_key"], from_d.isoformat(), to_d.isoformat())
             if df is not None and weekly: df = ud.to_weekly(df)
+        elif source == "Kite":
+            to_d = dt.date.today(); from_d = to_d - dt.timedelta(days=int(years*365)+15)
+            df = kd.fetch_daily(row["instrument_token"], from_d.isoformat(),
+                                to_d.isoformat(), kite_at, kite_key)
+            if df is not None and weekly: df = kd.to_weekly(df)
         else:
             df = sc.fetch_ohlcv(row["yahoo"], rng=yahoo_rng, interval=yahoo_interval)
         with lock: cache[key] = df
@@ -355,12 +373,15 @@ def rev_columns(unit="d"):
 # =================================== SIDEBAR ========================================
 st.sidebar.title("Scanner")
 scanner = st.sidebar.radio("Mode", ["Reversal patterns", "VCP breakout"], index=0)
-source = st.sidebar.radio("Data source", ["Upstox", "Dhan", "Yahoo"], index=0,
+source = st.sidebar.radio("Data source", ["Upstox", "Dhan", "Kite", "Yahoo"], index=0,
             help="Upstox = free, accurate, no token or login needed (recommended). "
                  "Dhan = needs access-token + paid Data API subscription. "
+                 "Kite = Zerodha Kite Connect (₹500/mo); daily login (paste token or TOTP auto-login). "
                  "Yahoo = free but less accurate for Indian stocks.")
 dhan_token = dhan_client = None
 dhan_auth_err = None
+kite_at = kite_key = None           # Kite access-token + api_key, set below if source==Kite
+kite_auth_err = None
 if source == "Dhan":
     dhan_client = get_secret("DHAN_CLIENT_ID", "")
     sec_token = get_secret("DHAN_ACCESS_TOKEN", "")
@@ -392,8 +413,76 @@ if source == "Dhan":
             except Exception as e:
                 dhan_auth_err = str(e)
                 st.sidebar.error("Auto-login failed — see message in main panel.")
+
+elif source == "Kite":
+    # API key/secret are app-level (set once). The access-token is what changes daily.
+    kite_key    = get_secret("KITE_API_KEY", "")
+    kite_secret = get_secret("KITE_API_SECRET", "")
+    sec_ktoken  = get_secret("KITE_ACCESS_TOKEN", "")
+    sec_kuser   = get_secret("KITE_USER_ID", "")
+    sec_kpass   = get_secret("KITE_PASSWORD", "")
+    sec_ktotp   = get_secret("KITE_TOTP_SECRET", "")
+    today = str(dt.date.today())
+    if not kite_key:
+        kite_key = st.sidebar.text_input("Kite API key", value="",
+                        help="From kite.trade -> your app. Best: store as KITE_API_KEY in secrets.")
+    if not kite_secret:
+        kite_secret = st.sidebar.text_input("Kite API secret", type="password",
+                        help="From kite.trade -> your app. Best: store as KITE_API_SECRET in secrets.")
+    # a token generated earlier today survives Streamlit reruns via session_state
+    if st.session_state.get("kite_token_day") != today:
+        st.session_state.pop("kite_access_token", None)     # expired overnight — drop it
+    kite_at = sec_ktoken or st.session_state.get("kite_access_token")
+
+    default_kmode = "Auto-login (TOTP)" if (sec_kuser and sec_kpass and sec_ktotp) else "Paste token"
+    kauth_mode = st.sidebar.radio("Kite login", ["Paste token", "Auto-login (TOTP)"],
+                    index=0 if default_kmode == "Paste token" else 1,
+                    help="Kite needs a fresh login each day. Paste token = click the link, log in, "
+                         "paste the request_token from the redirected URL. Auto-login = enter "
+                         "User ID + password + TOTP secret once; it logs in for you each day.")
+
+    if not kite_key or not kite_secret:
+        st.sidebar.warning("Enter your Kite API key & secret (or set them in secrets) to continue.")
+    elif kite_at:
+        st.sidebar.success("Kite token ready for today.")
+        if st.sidebar.button("Log out of Kite (clear token)"):
+            for k in ("kite_access_token", "kite_token_day"): st.session_state.pop(k, None)
+            st.rerun()
+    elif kauth_mode == "Paste token":
+        st.sidebar.markdown(f"**1.** [Log in to Kite →]({kd.login_url(kite_key)})")
+        st.sidebar.caption("After login you land on your Redirect URL like "
+                           "`https://127.0.0.1/?request_token=XXXX&action=login`. Paste XXXX below "
+                           "(or the whole URL).")
+        rt_raw = st.sidebar.text_input("2. request_token (or full redirect URL)", value="")
+        if rt_raw:
+            rt = rt_raw.strip()
+            if "request_token=" in rt:                # user pasted the whole URL — extract it
+                rt = urllib.parse.parse_qs(urllib.parse.urlparse(rt).query).get("request_token", [rt])[0]
+            try:
+                kite_at = kd.generate_session(kite_key, kite_secret, rt)
+                st.session_state["kite_access_token"] = kite_at
+                st.session_state["kite_token_day"] = today
+                st.sidebar.success("Logged in — token cached for today.")
+            except Exception as e:
+                kite_auth_err = str(e)
+                st.sidebar.error("Login failed — see message in main panel.")
+    else:   # Auto-login (TOTP)
+        kuser = sec_kuser or st.sidebar.text_input("Zerodha Client ID (e.g. AB1234)", value="")
+        kpass = sec_kpass or st.sidebar.text_input("Zerodha password", type="password")
+        ktotp = sec_ktotp or st.sidebar.text_input("TOTP secret", type="password",
+                        help="The text key behind the external-2FA TOTP QR on kite.zerodha.com "
+                             "(My Profile -> Settings -> account security -> External TOTP).")
+        if kuser and kpass and ktotp:
+            try:
+                kite_at = get_kite_auto_token(kite_key, kite_secret, kuser, kpass, ktotp, today)
+                st.session_state["kite_access_token"] = kite_at
+                st.session_state["kite_token_day"] = today
+                st.sidebar.caption("Auto-login token ready (refreshes daily).")
+            except Exception as e:
+                kite_auth_err = str(e)
+                st.sidebar.error("Auto-login failed — see message in main panel.")
         else:
-            st.sidebar.caption("Enter Client ID, PIN and TOTP secret (or set them in secrets).")
+            st.sidebar.caption("Enter Client ID, password and TOTP secret (or set them in secrets).")
 exch = st.sidebar.radio("Exchange", ["NSE", "BSE", "Both"], index=0)
 timeframe = st.sidebar.radio("Timeframe", ["Daily", "Weekly"], index=0)
 
@@ -433,6 +522,12 @@ if use_upload and up_file is not None:
             uni, unmapped = ud.map_universe(uni, nse_map, bse_map)
         except Exception as e:
             st.title("Bullish Scanners"); st.error(f"Could not load Upstox instruments: {e}"); st.stop()
+    elif source == "Kite":
+        try:
+            nse_map, bse_map = kite_maps()
+            uni, unmapped = kd.map_universe(uni, nse_map, bse_map)
+        except Exception as e:
+            st.title("Bullish Scanners"); st.error(f"Could not load the Kite instrument list: {e}"); st.stop()
     if "yahoo" not in uni.columns:
         uni["yahoo"] = uni.apply(lambda r: r["symbol"] + (".NS" if r["exch"] == "NSE" else ".BO"), axis=1)
     cap_note = f"your uploaded list ({len(uni)} mapped)"
@@ -442,6 +537,8 @@ elif full_universe:
             uni = dd.full_universe(exch, dd.load_scrip_master())
         elif source == "Upstox":
             uni = ud.full_universe(exch)
+        elif source == "Kite":
+            uni = kd.full_universe(exch)
         else:                                    # Yahoo: use Upstox's symbol list
             uni = ud.full_universe(exch)
     except Exception as e:
@@ -476,6 +573,12 @@ else:
             uni, unmapped = ud.map_universe(uni, nse_map, bse_map)
         except Exception as e:
             st.title("Bullish Scanners"); st.error(f"Could not load Upstox instruments: {e}"); st.stop()
+    elif source == "Kite":
+        try:
+            nse_map, bse_map = kite_maps()
+            uni, unmapped = kd.map_universe(uni, nse_map, bse_map)
+        except Exception as e:
+            st.title("Bullish Scanners"); st.error(f"Could not load the Kite instrument list: {e}"); st.stop()
 
 if exch == "Both":
     nse_syms = set(uni[uni["exch"] == "NSE"]["symbol"].str.upper())
@@ -492,7 +595,7 @@ st.sidebar.markdown(f"**{len(uni)}** stocks "
                     + ("from your uploaded list" if (use_upload and up_file is not None)
                        else "in the full universe" if full_universe else "match")
                     + (f" ({len(unmapped)} not listed, skipped)"
-                       if (not full_universe and source in ("Dhan","Upstox") and unmapped) else ""))
+                       if (not full_universe and source in ("Dhan","Upstox","Kite") and unmapped) else ""))
 total_uni = len(uni)
 scan_all = st.sidebar.checkbox("Scan ALL matching stocks (no limit)", value=False,
             help="Scans every matching stock. Large scans auto-throttle and cache for the day.")
@@ -593,9 +696,10 @@ else:
                 ["All", "Flat", "Ascending", "Descending", "HiTightFlag", "CupHandle", "DarvasBox", "PocketPivot", "EpisodicPivot"],
                 index=0, help="Filter results by base shape. Each non-Flat type needs its own toggle enabled above.")
 
-dft_workers = 5 if source == "Dhan" else 8
+dft_workers = 3 if source == "Kite" else 5 if source == "Dhan" else 8
 workers = st.sidebar.slider("Fetch threads", 1, 16, dft_workers,
-            help="Dhan rate-limits the data API; keep this modest. Auto-reduced for very large scans.")
+            help="Dhan & Kite rate-limit the data API (Kite ~3 req/s); keep modest. "
+                 "Auto-reduced for very large scans.")
 run = st.sidebar.button("Run scan", type="primary", use_container_width=True)
 
 if not scan_all and total_uni > max_n:
@@ -615,6 +719,7 @@ else:
 st.caption(f"Data source: **{source}**" + {
     "Dhan": "  ·  Dhan historical API (Data API subscription required)",
     "Upstox": "  ·  Upstox historical API (free, no token or login needed)",
+    "Kite": "  ·  Zerodha Kite Connect (₹500/mo; daily login required)",
     "Yahoo": "  ·  Yahoo Finance",
 }.get(source, ""))
 
@@ -646,22 +751,51 @@ if source == "Dhan":
                 else:
                     st.info("Data API is active — you're good to run the scan.")
 
+if source == "Kite":
+    if kite_auth_err:
+        st.error(f"Kite login error: {kite_auth_err}")
+    cc1, cc2 = st.columns([1, 3])
+    if cc1.button("Check Kite connection", use_container_width=True):
+        if not (kite_at and kite_key):
+            st.warning("No token yet — log in (paste token or TOTP auto-login) in the sidebar first.")
+        else:
+            prof = kd.get_profile(kite_key, kite_at)
+            if prof.get("status") == "error" or "user_id" not in prof:
+                st.error(f"Token rejected: {prof.get('message', prof)}. Log in again — "
+                         "Kite tokens expire daily (~6 AM).")
+            else:
+                st.success(f"Token valid for {prof.get('user_name','?')} ({prof.get('user_id','?')}).")
+                cols = st.columns(3)
+                cols[0].metric("Broker", prof.get("broker", "—"))
+                cols[1].metric("Exchanges", str(len(prof.get("exchanges", []) or [])))
+                cols[2].metric("Type", prof.get("user_type", "—"))
+                st.info("Connected — you're good to run the scan.")
+
 # =================================== RUN ============================================
 if run:
     if source == "Dhan" and not dhan_token:
         st.error("Enter your Dhan access-token in the sidebar (or set DHAN_ACCESS_TOKEN in secrets).")
+        st.stop()
+    if source == "Kite" and not (kite_at and kite_key):
+        st.error("Log in to Kite in the sidebar first (paste the request_token, or set up TOTP auto-login).")
         st.stop()
     rows = uni.to_dict("records")
     daystamp = str(dt.date.today())
     n_scan = len(rows)
     base_workers = workers
     if n_scan > 500:
-        base_workers, req_delay = min(workers, 4 if source == "Dhan" else 6), 0.2 if source == "Dhan" else 0.15
+        if source == "Kite":
+            base_workers, req_delay = min(workers, 3), 0.34          # Kite ~3 req/s historical cap
+        elif source == "Dhan":
+            base_workers, req_delay = min(workers, 4), 0.2
+        else:
+            base_workers, req_delay = min(workers, 6), 0.15
         st.info(f"Scanning {n_scan} stocks via {source} with throttling — this can take several minutes"
-                + (" (Dhan rate-limits the data API)." if source == "Dhan" else ".")
+                + (" (Dhan rate-limits the data API)." if source == "Dhan"
+                   else " (Kite caps historical calls at ~3/sec)." if source == "Kite" else ".")
                 + " Results cache for the day, so the next run is instant.")
     else:
-        req_delay = 0.05 if source == "Dhan" else 0.0
+        req_delay = 0.34 if source == "Kite" else 0.05 if source == "Dhan" else 0.0
     weekly = (timeframe == "Weekly")
     yahoo_interval = "1wk" if weekly else "1d"
 
@@ -671,7 +805,7 @@ if run:
     if scanner == "Reversal patterns":
         years = 2.5 if weekly else 1.2
         yahoo_rng = "5y" if weekly else "1y"
-        fetch_fn = make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, dhan_token, dhan_client, daystamp)
+        fetch_fn = make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, dhan_token, dhan_client, daystamp, kite_at=kite_at, kite_key=kite_key)
         with st.spinner(f"Screening {n_scan} stocks ({timeframe.lower()})..."):
             try:
                 results, scanned, failed = sc.run_screen(rows, fetch_fn=fetch_fn, scan_last_n=scan_n,
@@ -685,8 +819,9 @@ if run:
     else:
         years = 3.5 if weekly else 2.2
         yahoo_rng = vc.tf_params(timeframe)["rng"]
-        fetch_fn = make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, dhan_token, dhan_client, daystamp)
+        fetch_fn = make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, dhan_token, dhan_client, daystamp, kite_at=kite_at, kite_key=kite_key)
         nrow = (dd.NIFTY_ROW if source == "Dhan" else ud.NIFTY_ROW if source == "Upstox"
+                else kd.NIFTY_ROW if source == "Kite"
                 else {"yahoo": "^NSEI", "symbol": "NIFTY", "exch": "NSE"})
         nret = vc.nifty_mom(timeframe, fetch_fn=fetch_fn, nifty_row=nrow)
         with st.spinner(f"Scanning {n_scan} stocks for VCP bases ({timeframe.lower()})..."):
