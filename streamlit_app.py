@@ -61,23 +61,46 @@ def get_secret(k, default=""):
     except Exception: return default
 
 # ----------------------------------- list loaders -----------------------------------
-def parse_nse(raw):
+def _pick_col(raw, candidates):
+    """Return the actual column whose (stripped, lowercased) name matches a candidate."""
+    low = {str(c).strip().lower(): c for c in raw.columns}
+    for cand in candidates:
+        if cand.lower() in low:
+            return low[cand.lower()]
+    return None
+
+_JUNK_SYMS = {"", "NAN", "NONE", "SYMBOL", "STOCK NAME", "SCRIP ID", "TICKER", "COMPANYID"}
+
+def _build_list(raw, exch, sym_cands, name_cands, sec_cands):
     raw = raw.rename(columns=lambda c: str(c).strip())
-    out = pd.DataFrame({"symbol": raw["companyId"].astype(str).str.strip(),
-        "name": raw["Name"].astype(str).str.strip(),
-        "sector": raw["Sector"].astype(str).str.strip() if "Sector" in raw else "", "exch": "NSE"})
-    out["yahoo"] = out["symbol"] + ".NS"
-    return out[out["symbol"].str.len() > 0]
+    sym_col = _pick_col(raw, sym_cands) or raw.columns[0]      # single-column list -> first col
+    name_col = _pick_col(raw, name_cands)
+    sec_col = _pick_col(raw, sec_cands)
+    sym = raw[sym_col].astype(str).str.strip().str.upper()
+    out = pd.DataFrame({
+        "symbol": sym,
+        "name": (raw[name_col].astype(str).str.strip()
+                 if (name_col and name_col != sym_col) else sym),
+        "sector": (raw[sec_col].astype(str).str.strip() if sec_col else ""),
+        "exch": exch})
+    out["yahoo"] = out["symbol"] + (".NS" if exch == "NSE" else ".BO")
+    out = out[(out["symbol"].str.len() > 0) & (~out["symbol"].isin(_JUNK_SYMS))]
+    return out.drop_duplicates(subset=["symbol"]).reset_index(drop=True)
+
+def parse_nse(raw):
+    return _build_list(raw, "NSE",
+        sym_cands=["companyId", "SYMBOL", "Symbol", "Stock Name", "Ticker", "Security Id", "Scrip ID"],
+        name_cands=["Name", "NAME OF COMPANY", "Company Name", "Security Name", "Stock Name"],
+        sec_cands=["Sector", "Industry"])
 
 def parse_bse(raw):
     raw = raw.rename(columns=lambda c: str(c).strip())
-    if "Status" in raw:
+    if "Status" in raw:                                        # keep only active scrips when present
         raw = raw[raw["Status"].astype(str).str.strip().str.lower() == "active"]
-    out = pd.DataFrame({"symbol": raw["Scrip ID"].astype(str).str.strip(),
-        "name": raw["Scrip Name"].astype(str).str.strip(),
-        "sector": raw["Industry"].astype(str).str.strip() if "Industry" in raw else "", "exch": "BSE"})
-    out["yahoo"] = out["symbol"] + ".BO"
-    return out[out["symbol"].str.len() > 0]
+    return _build_list(raw, "BSE",
+        sym_cands=["Scrip ID", "Security Id", "SYMBOL", "Symbol", "Stock Name", "Ticker"],
+        name_cands=["Scrip Name", "Security Name", "Name", "Company Name", "Stock Name"],
+        sec_cands=["Industry", "Sector"])
 
 @st.cache_data(show_spinner=False)
 def load_bundled(kind):
