@@ -208,6 +208,53 @@ def get_dhan_auto_token(client_id, pin, totp_secret, daystamp):
     return tok
 
 # --------------------------- persistent, thread-safe fetch cache --------------------
+def _source_maps(source):
+    if source == "Kite":   return kite_maps()
+    if source == "Upstox": return upstox_maps()
+    if source == "Dhan":   return dhan_maps()
+    return None, None
+
+def _source_mapper(source):
+    return {"Kite": kd.map_universe, "Upstox": ud.map_universe, "Dhan": dd.map_universe}.get(source)
+
+def map_smart(source, uni, yahoo_fallback):
+    """Map an uploaded/bundled universe to the chosen broker with two safety nets so
+    nothing is silently dropped:
+      1) a symbol that misses on its tagged exchange is retried on the OTHER exchange
+         (many names are tagged NSE in the CSV but the broker lists them on BSE, or vice-versa);
+      2) symbols still absent from the broker's instrument master (typically NSE-Emerge /
+         BSE-SME scrips the broker API doesn't carry) are optionally kept as Yahoo-fetch rows,
+         so they are still scanned rather than skipped.
+    Returns (mapped_df, unmapped_list, n_yahoo_fallback)."""
+    nse_map, bse_map = _source_maps(source)
+    mapper = _source_mapper(source)
+    base = uni.copy()
+    base["symbol"] = base["symbol"].astype(str).str.upper()
+    def _got(df): return set(df["symbol"].astype(str).str.upper()) if len(df) else set()
+    mapped, _ = mapper(base, nse_map, bse_map)
+    got = _got(mapped)
+    # 1) retry the misses on the opposite exchange
+    miss = base[~base["symbol"].isin(got)].copy()
+    if len(miss):
+        miss["exch"] = miss["exch"].map({"NSE": "BSE", "BSE": "NSE"}).fillna(miss["exch"])
+        m2, _ = mapper(miss, nse_map, bse_map)
+        if len(m2):
+            mapped = pd.concat([mapped, m2], ignore_index=True); got |= _got(m2)
+    # 2) whatever the broker still can't map -> Yahoo rows (or reported as skipped)
+    still = base[~base["symbol"].isin(got)].copy()
+    n_yahoo = 0; unmapped = []
+    if len(still):
+        if yahoo_fallback:
+            still["yahoo"] = still.apply(
+                lambda r: str(r["symbol"]).upper() + (".NS" if r["exch"] == "NSE" else ".BO"), axis=1)
+            for c in ("instrument_token", "instrument_key", "security_id"):
+                if c in mapped.columns and c not in still.columns:
+                    still[c] = None
+            mapped = pd.concat([mapped, still], ignore_index=True); n_yahoo = len(still)
+        else:
+            unmapped = [f"{r.symbol}.{r.exch}" for r in still.itertuples()]
+    return mapped.reset_index(drop=True), unmapped, n_yahoo
+
 @st.cache_resource
 def _fetch_cache():
     return {}, threading.Lock()
@@ -215,15 +262,26 @@ def _fetch_cache():
 def make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, token, client, daystamp,
                kite_at=None, kite_key=None):
     cache, lock = _fetch_cache()
+    def _has(v):
+        if v is None: return False
+        try:
+            if isinstance(v, float) and pd.isna(v): return False
+        except Exception: pass
+        return str(v).strip() not in ("", "nan", "None")
     def f(row):
-        rid = (row.get("security_id") if source == "Dhan"
+        bid = (row.get("security_id") if source == "Dhan"
                else row.get("instrument_key") if source == "Upstox"
                else row.get("instrument_token") if source == "Kite"
-               else row.get("yahoo"))
+               else None)
+        # broker row with no id (SME/Emerge the broker doesn't list) -> Yahoo fallback
+        use_yahoo = (source == "Yahoo") or (source in ("Dhan", "Upstox", "Kite") and not _has(bid))
+        rid = ("Y:" + str(row.get("yahoo"))) if use_yahoo else bid
         key = (source, rid, weekly, daystamp)
         with lock:
             if key in cache: return cache[key]
-        if source == "Dhan":
+        if use_yahoo:
+            df = sc.fetch_ohlcv(row["yahoo"], rng=yahoo_rng, interval=yahoo_interval)
+        elif source == "Dhan":
             to_d = dt.date.today(); from_d = to_d - dt.timedelta(days=int(years*365)+15)
             df = dd.fetch_daily(row["security_id"], row["exchange_segment"],
                                 row.get("instrument","EQUITY"), from_d.isoformat(),
@@ -523,7 +581,13 @@ full_universe = st.sidebar.checkbox("Scan entire NSE/BSE universe (ignore my lis
                     help="Screens every cash-equity on the selected exchange(s) straight from the "
                          "data source, instead of your uploaded CSVs.")
 
+yahoo_fill = st.sidebar.checkbox("Scan broker-missing symbols via Yahoo", value=True,
+                    help="If the selected broker (Upstox/Dhan/Kite) doesn't list a symbol — typically "
+                         "NSE-Emerge / BSE-SME scrips — fetch it from Yahoo instead of skipping it, so "
+                         "every stock in your list is scanned. Turn off to only use the broker's own data.")
+
 unmapped = []
+n_yahoo = 0
 cap_note = None
 if use_upload and up_file is not None:
     rows_up = parse_symbol_upload(up_file, "BSE" if exch == "BSE" else "NSE")
@@ -533,24 +597,11 @@ if use_upload and up_file is not None:
                  "(Ticker / companyId / NSE Symbol also work), or a plain list with one symbol per line.")
         st.stop()
     uni = pd.DataFrame(rows_up)
-    if source == "Dhan":
+    if source in ("Dhan", "Upstox", "Kite"):
         try:
-            nse_map, bse_map = dhan_maps()
-            uni, unmapped = dd.map_universe(uni, nse_map, bse_map)
+            uni, unmapped, n_yahoo = map_smart(source, uni, yahoo_fill)
         except Exception as e:
-            st.title("Bullish Scanners"); st.error(f"Could not load the Dhan instrument master: {e}"); st.stop()
-    elif source == "Upstox":
-        try:
-            nse_map, bse_map = upstox_maps()
-            uni, unmapped = ud.map_universe(uni, nse_map, bse_map)
-        except Exception as e:
-            st.title("Bullish Scanners"); st.error(f"Could not load Upstox instruments: {e}"); st.stop()
-    elif source == "Kite":
-        try:
-            nse_map, bse_map = kite_maps()
-            uni, unmapped = kd.map_universe(uni, nse_map, bse_map)
-        except Exception as e:
-            st.title("Bullish Scanners"); st.error(f"Could not load the Kite instrument list: {e}"); st.stop()
+            st.title("Bullish Scanners"); st.error(f"Could not load the {source} instrument list: {e}"); st.stop()
     if "yahoo" not in uni.columns:
         uni["yahoo"] = uni.apply(lambda r: r["symbol"] + (".NS" if r["exch"] == "NSE" else ".BO"), axis=1)
     cap_note = f"your uploaded list ({len(uni)} mapped)"
@@ -583,25 +634,12 @@ else:
                    "**bse_stocks.csv** (BSE) next to this app, or upload them in the sidebar.")
         st.stop()
     uni = pd.concat(frames, ignore_index=True)
-    # Map symbols -> source IDs (drops anything the source doesn't list)
-    if source == "Dhan":
+    # Map symbols -> source IDs, with other-exchange retry + optional Yahoo fallback
+    if source in ("Dhan", "Upstox", "Kite"):
         try:
-            nse_map, bse_map = dhan_maps()
-            uni, unmapped = dd.map_universe(uni, nse_map, bse_map)
+            uni, unmapped, n_yahoo = map_smart(source, uni, yahoo_fill)
         except Exception as e:
-            st.title("Bullish Scanners"); st.error(f"Could not load the Dhan instrument master: {e}"); st.stop()
-    elif source == "Upstox":
-        try:
-            nse_map, bse_map = upstox_maps()
-            uni, unmapped = ud.map_universe(uni, nse_map, bse_map)
-        except Exception as e:
-            st.title("Bullish Scanners"); st.error(f"Could not load Upstox instruments: {e}"); st.stop()
-    elif source == "Kite":
-        try:
-            nse_map, bse_map = kite_maps()
-            uni, unmapped = kd.map_universe(uni, nse_map, bse_map)
-        except Exception as e:
-            st.title("Bullish Scanners"); st.error(f"Could not load the Kite instrument list: {e}"); st.stop()
+            st.title("Bullish Scanners"); st.error(f"Could not load the {source} instrument list: {e}"); st.stop()
 
 if exch == "Both":
     nse_syms = set(uni[uni["exch"] == "NSE"]["symbol"].str.upper())
@@ -617,6 +655,8 @@ if sectors:
 st.sidebar.markdown(f"**{len(uni)}** stocks "
                     + ("from your uploaded list" if (use_upload and up_file is not None)
                        else "in the full universe" if full_universe else "match")
+                    + (f" · {n_yahoo} via Yahoo (not in {source}'s list)"
+                       if (not full_universe and n_yahoo) else "")
                     + (f" ({len(unmapped)} not listed, skipped)"
                        if (not full_universe and source in ("Dhan","Upstox","Kite") and unmapped) else ""))
 total_uni = len(uni)
