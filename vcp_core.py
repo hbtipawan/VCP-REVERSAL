@@ -289,9 +289,28 @@ def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
                 cup_on=False, cup_min_depth=0.12, cup_max_depth=0.40, cup_handle_max=0.15,
                 darvas_on=False, darvas_min_pct=0.03, darvas_max_pct=0.40,
                 pp_on=False, pp_max_ext=0.05,
-                ep_on=False, ep_move_min=0.10, ep_gap_min=0.05, ep_vol_min=3.0, ep_dorm_max=0.30):
-    p=tf_params(timeframe); A=vcp_arrays(df,p); n=A['n']
-    if n < max(p['mal'], p['win'])+5: return None
+                ep_on=False, ep_move_min=0.10, ep_gap_min=0.05, ep_vol_min=3.0, ep_dorm_max=0.30,
+                short_history=False):
+    p=tf_params(timeframe); n=len(df)
+    full_need=max(p['mal'], p['win'])+5
+    short=False; roff_f, roff_l = 10, 20
+    if n < full_need:
+        # not enough history for the full 200-SMA + 52-period windows.
+        floor = 60 if timeframe != "Weekly" else 40    # minimum bars to say anything meaningful
+        if (not short_history) or n < floor:
+            return None
+        short=True
+        # scale every lookback proportionally to the data we DO have, preserving the
+        # maf<mam<mal<=win ordering so the trend-stack test keeps its meaning.
+        scale=(n-5)/max(p['mal'], p['win'])
+        p=dict(p)
+        for k in ('maf','mam','mal','win','mom','funnel','epw'):
+            p[k]=max(3, int(round(p[k]*scale)))
+        p['mam']=max(p['mam'], p['maf']+1)
+        p['mal']=max(p['mal'], p['mam']+1)
+        p['win']=max(p['win'], p['mal'])
+        roff_f=max(1, int(round(10*scale))); roff_l=max(1, int(round(20*scale)))
+    A=vcp_arrays(df,p)
     i=n-1; c=A['c'][i]
     maf,mam,mal=A['maf'][i],A['mam'][i],A['mal'][i]
     if not all(_ok(x) for x in (c,maf,mam,mal)) or c<=0: return None
@@ -320,10 +339,10 @@ def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
                 rs=round(rs_e*100,1), pivot=ep['piv'], stop=ep['blo'],
                 dist_pivot=round((ep['piv']-c)/c*100,2), vol_surge=round(ep['volr'],2),
                 target=round(c+2*(c-ep['blo']),2), base_type="EpisodicPivot",
-                slope=None, pole=None, note=ep['note'], date=str(df['date'].iloc[i].date()))
+                slope=None, pole=None, note=ep['note'], short_hist=short, date=str(df['date'].iloc[i].date()))
     # --- trend template gates (Relaxed / Standard / Strict). Strict = textbook Stage 2 ---
-    maf_rising = maf > A['maf'][i-10]
-    mal_rising = mal > A['mal'][i-20]
+    maf_rising = maf > A['maf'][i-roff_f]
+    mal_rising = mal > A['mal'][i-roff_l]
     if strictness=="Strict":
         if not (c>maf>mam>mal and mal_rising): return None
     elif strictness=="Relaxed":
@@ -424,7 +443,7 @@ def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
         stop=round(base['blo'],2), dist_pivot=round((base['piv']-c)/c*100,2),
         vol_surge=round(vol_surge,2), target=round(c+2*(c-base['blo']),2),
         base_type=base_type, slope=slope, pole=pole, note=note,
-        date=str(df['date'].iloc[i].date()))
+        short_hist=short, date=str(df['date'].iloc[i].date()))
 
 def nifty_mom(timeframe="Daily", fetch_fn=None, nifty_row=None):
     """Benchmark momentum return over the lookback. fetch_fn(row)->df; nifty_row identifies
@@ -473,7 +492,8 @@ def build_vcp_html(rows, scanned, failed, timeframe="Daily", summary=""):
         d=sc._dv
         trs+=(f"<tr><td data-v=\"{d(g)}\"><span class='grade' style='background:{gcol.get(g,'#445')}'>{g}</span></td>"
               f"<td data-v=\"{d(st_)}\"><span class='stt {stcss}'>{st_}</span></td>"
-              f"<td data-v=\"{d(bt_)}\"><span class='bt {btcss}'>{bt_}</span></td>"
+              f"<td data-v=\"{d(bt_)}\"><span class='bt {btcss}'>{bt_}</span>"
+              f"{'<span class=sh title=\"short trading history \u2014 52-week metrics use fewer bars\"> \u26a0</span>' if r.get('short_hist') else ''}</td>"
               f"<td data-v=\"{d(sl_v)}\">{sl_}</td>"
               f"<td class='sym' data-v=\"{d(r['symbol'])}\"><a href='{sc.tv_url(r['exch'],r['symbol'])}' target='_blank' "
               f"rel='noopener'>{r['symbol']}</a><span class='ex'>{r['exch']}</span></td>"
@@ -523,6 +543,7 @@ th{{background:var(--panel);font-size:13px;text-transform:uppercase;color:var(--
 .bt.cup{{background:#eeedfe;color:#3c3489}}.bt.dvb{{background:#e1f5ee;color:#0f6e56}}
 .bt.pp{{background:#fbeaf0;color:#993556}}
 .bt.ep{{background:#fff3cd;color:#7a4f00}}
+.sh{{color:#b3261e;font-weight:800}}
 .empty{{padding:22px;background:var(--panel);border:1px dashed var(--line);border-radius:12px;color:var(--mut)}}
 .foot{{margin-top:28px;font-size:15px;color:var(--mut);background:var(--panel);border:1px solid var(--line);
 border-radius:12px;padding:16px 18px}}</style>{sc.SORT_CSS}</head><body><div class="wrap">
@@ -543,7 +564,9 @@ box %); <b>PocketPivot</b> = an early in-base entry on an up-day whose volume to
 event-day high, stop at the event-day low). <b>Slope</b> = trendline slope in %/bar (Flat = &mdash;).
 Tight = base span %; Dry = base volume vs 50-bar avg (lower = quieter base); Contr = recent vs earlier range
 (lower = contracting); enter on a move through the Pivot, stop at base low. Grade reflects base quality;
-Ascending/Descending grades are heuristic and not yet backtested. Research tool, not investment advice.</div>
+Ascending/Descending grades are heuristic and not yet backtested. <span class="sh">&#9888;</span> = short trading
+history (recent listing): the 200-SMA and 52-week-high/low windows were scaled to the bars available, so the
+trend and near-high checks rest on less data &mdash; treat these grades as provisional. Research tool, not investment advice.</div>
 </div>{sc.SORT_JS}</body></html>"""
 
 def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
@@ -555,7 +578,8 @@ def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
                    cup_on=False, cup_min_depth=0.12, cup_max_depth=0.40, cup_handle_max=0.15,
                    darvas_on=False, darvas_min_pct=0.03, darvas_max_pct=0.40,
                    pp_on=False, pp_max_ext=0.05,
-                   ep_on=False, ep_move_min=0.10, ep_gap_min=0.05, ep_vol_min=3.0, ep_dorm_max=0.30):
+                   ep_on=False, ep_move_min=0.10, ep_gap_min=0.05, ep_vol_min=3.0, ep_dorm_max=0.30,
+                   short_history=False):
     fetch_fn = fetch_fn or (lambda row: sc.fetch_ohlcv(row["yahoo"]))
     out=[]; scanned=0; failed=[]; total=len(rows); done=0
     def work(r):
@@ -575,7 +599,8 @@ def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
                                    cup_on,cup_min_depth,cup_max_depth,cup_handle_max,
                                    darvas_on,darvas_min_pct,darvas_max_pct,
                                    pp_on,pp_max_ext,
-                                   ep_on,ep_move_min,ep_gap_min,ep_vol_min,ep_dorm_max)
+                                   ep_on,ep_move_min,ep_gap_min,ep_vol_min,ep_dorm_max,
+                                   short_history=short_history)
                 except Exception: m=None
                 if m: out.append(m)
             if progress: progress(done,total,r["symbol"])

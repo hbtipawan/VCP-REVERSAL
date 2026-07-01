@@ -260,7 +260,7 @@ def _fetch_cache():
     return {}, threading.Lock()
 
 def make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, token, client, daystamp,
-               kite_at=None, kite_key=None):
+               kite_at=None, kite_key=None, yahoo_fill=True):
     cache, lock = _fetch_cache()
     def _has(v):
         if v is None: return False
@@ -268,6 +268,20 @@ def make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, token, client, 
             if isinstance(v, float) and pd.isna(v): return False
         except Exception: pass
         return str(v).strip() not in ("", "nan", "None")
+    def _yahoo_any(row):
+        """Fetch from Yahoo trying BOTH exchange suffixes (.NS then .BO), since a
+        symbol may be listed on the exchange opposite to the CSV's tag."""
+        y = str(row.get("yahoo") or "")
+        base = y[:-3] if y.endswith((".NS", ".BO")) else str(row.get("symbol", "")).upper()
+        cands, seen = [], set()
+        for c in ([y] if y else []) + [base + ".NS", base + ".BO"]:
+            if c and c not in seen:
+                seen.add(c); cands.append(c)
+        for c in cands:
+            df = sc.fetch_ohlcv(c, rng=yahoo_rng, interval=yahoo_interval)
+            if df is not None and len(df):
+                return df
+        return None
     def f(row):
         bid = (row.get("security_id") if source == "Dhan"
                else row.get("instrument_key") if source == "Upstox"
@@ -280,7 +294,7 @@ def make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, token, client, 
         with lock:
             if key in cache: return cache[key]
         if use_yahoo:
-            df = sc.fetch_ohlcv(row["yahoo"], rng=yahoo_rng, interval=yahoo_interval)
+            df = _yahoo_any(row)
         elif source == "Dhan":
             to_d = dt.date.today(); from_d = to_d - dt.timedelta(days=int(years*365)+15)
             df = dd.fetch_daily(row["security_id"], row["exchange_segment"],
@@ -297,7 +311,12 @@ def make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, token, client, 
                                 to_d.isoformat(), kite_at, kite_key)
             if df is not None and weekly: df = kd.to_weekly(df)
         else:
-            df = sc.fetch_ohlcv(row["yahoo"], rng=yahoo_rng, interval=yahoo_interval)
+            df = _yahoo_any(row)
+        # broker listed the symbol but returned no usable history -> last-ditch Yahoo
+        if (not use_yahoo) and yahoo_fill and (df is None or (hasattr(df, "__len__") and len(df) == 0)):
+            df = _yahoo_any(row)
+            if df is not None and weekly and source in ("Dhan", "Upstox", "Kite"):
+                pass  # _yahoo_any already returns the right timeframe via fetch_ohlcv rng/interval
         with lock: cache[key] = df
         return df
     return f
@@ -408,7 +427,9 @@ def vcp_columns():
         {"label":"Status","type":"text","cls":"l","v":lambda r:r['status'],
          "c":lambda r:f"<span class='stt {'bk' if r['status']=='Breakout' else 'co'}'>{r['status']}</span>"},
         {"label":"Type","type":"text","cls":"l","v":lambda r:r.get('base_type','Flat'),
-         "c":lambda r:r.get('base_type','Flat')},
+         "c":lambda r:r.get('base_type','Flat') + ("<span style='color:#ff6b6b;font-weight:800' "
+                      "title='short trading history — 52w metrics use fewer bars'> &#9888;</span>"
+                      if r.get('short_hist') else "")},
         {"label":"Slope/Pole","type":"num",
          "v":lambda r:(r.get('pole') if r.get('base_type')=='HiTightFlag' and r.get('pole') is not None
                        else (r.get('slope') if r.get('slope') is not None else 0)),
@@ -671,7 +692,7 @@ else:
 
 scan_n = 1; vol_only = False
 near_high = 25; max_tight = 5; min_base = 3; strictness = "Strict"; min_grade = "All (A/B/C)"; status_f = "All"
-low_on = True; low_min = 30.0; low_max = None
+low_on = True; low_min = 30.0; low_max = None; incl_recent = False
 wedge_on = False; wedge_lo = 0.05; wedge_hi = 0.80; base_f = "All"
 htf_on = False; htf_thrust = 80; htf_flag = 25
 cup_on = False; cup_dmin = 12; cup_dmax = 40; cup_hmax = 15
@@ -687,6 +708,11 @@ else:
     max_tight = st.sidebar.slider("Max base tightness (%)", 2, 10, 5)
     min_base  = st.sidebar.slider("Min base length (bars)", 3, 15, 3)
     strictness = st.sidebar.selectbox("Trend strictness", ["Strict", "Standard", "Relaxed"], index=0)
+    incl_recent = st.sidebar.checkbox("Include recent listings (short history)", value=False,
+                help="Also scan stocks with less than ~13 months of data (min 60 daily bars) by scaling the "
+                     "200-SMA and 52-week-high/low windows down to the bars available. These rows are flagged "
+                     "with \u26a0; their trend and near-high checks rest on less data, so treat the grades as "
+                     "provisional. Applies to the Daily timeframe (Weekly already needs ~57 weeks).")
     min_grade = st.sidebar.selectbox("Minimum grade", ["A only", "A & B", "All (A/B/C)"], index=2)
     status_f  = st.sidebar.selectbox("Status", ["All", "Coiling", "Breakout"], index=0)
     use_low = st.sidebar.checkbox("Filter by distance from 52-week low", value=True,
@@ -868,7 +894,7 @@ if run:
     if scanner == "Reversal patterns":
         years = 2.5 if weekly else 1.2
         yahoo_rng = "5y" if weekly else "1y"
-        fetch_fn = make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, dhan_token, dhan_client, daystamp, kite_at=kite_at, kite_key=kite_key)
+        fetch_fn = make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, dhan_token, dhan_client, daystamp, kite_at=kite_at, kite_key=kite_key, yahoo_fill=yahoo_fill)
         with st.spinner(f"Screening {n_scan} stocks ({timeframe.lower()})..."):
             try:
                 results, scanned, failed = sc.run_screen(rows, fetch_fn=fetch_fn, scan_last_n=scan_n,
@@ -882,7 +908,7 @@ if run:
     else:
         years = 3.5 if weekly else 2.2
         yahoo_rng = vc.tf_params(timeframe)["rng"]
-        fetch_fn = make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, dhan_token, dhan_client, daystamp, kite_at=kite_at, kite_key=kite_key)
+        fetch_fn = make_fetch(source, weekly, years, yahoo_rng, yahoo_interval, dhan_token, dhan_client, daystamp, kite_at=kite_at, kite_key=kite_key, yahoo_fill=yahoo_fill)
         nrow = (dd.NIFTY_ROW if source == "Dhan" else ud.NIFTY_ROW if source == "Upstox"
                 else kd.NIFTY_ROW if source == "Kite"
                 else {"yahoo": "^NSEI", "symbol": "NIFTY", "exch": "NSE"})
@@ -901,7 +927,8 @@ if run:
                                             darvas_on=darvas_on, darvas_min_pct=darvas_dmin/100, darvas_max_pct=darvas_dmax/100,
                                             pp_on=pp_on, pp_max_ext=pp_ext/100,
                                             ep_on=ep_on, ep_move_min=ep_move/100, ep_gap_min=ep_gap/100,
-                                            ep_vol_min=ep_vol, ep_dorm_max=ep_dorm/100)
+                                            ep_vol_min=ep_vol, ep_dorm_max=ep_dorm/100,
+                                            short_history=incl_recent)
             except PermissionError as e:
                 bar.empty(); st.error(str(e)); st.stop()
         bar.empty()
