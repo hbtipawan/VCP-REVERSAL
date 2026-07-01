@@ -326,6 +326,32 @@ def run_screen(rows, fetch_fn=None, scan_last_n=1, max_workers=8, progress=None,
     return results, scanned, failed
 
 # --------------------------------------------------------- HTML report ----
+SORT_CSS = ("<style>"
+  "table.sortable thead th{cursor:pointer;user-select:none;white-space:nowrap}"
+  "table.sortable thead th:hover{background:#e9eef6;color:#0d47a1}"
+  "table.sortable thead th .ar{color:#0d47a1;font-size:12px;margin-left:3px}"
+  ".sorthint{font-size:15px;color:#3a4654;margin:2px 0 12px}"
+  ".sorthint b{color:#0d47a1}"
+  "</style>")
+
+SORT_JS = ("<script>(function(){"
+  "function mk(tbl){var ths=tbl.tHead.rows[0].cells,tb=tbl.tBodies[0],cur=-1,asc=true;"
+  "for(var i=0;i<ths.length;i++){(function(i){ths[i].addEventListener('click',function(){"
+  "asc=(cur===i)?!asc:true;cur=i;var num=ths[i].getAttribute('data-t')==='num';"
+  "var rows=Array.prototype.slice.call(tb.rows);"
+  "rows.sort(function(a,b){var x=a.cells[i].getAttribute('data-v'),y=b.cells[i].getAttribute('data-v');"
+  "if(num){x=parseFloat(x);y=parseFloat(y);if(isNaN(x))x=-1e18;if(isNaN(y))y=-1e18;return asc?x-y:y-x;}"
+  "x=(x||'').toLowerCase();y=(y||'').toLowerCase();return asc?(x<y?-1:x>y?1:0):(x>y?-1:x<y?1:0);});"
+  "rows.forEach(function(r){tb.appendChild(r);});"
+  "for(var j=0;j<ths.length;j++){var s=ths[j].querySelector('.ar');if(s)s.textContent=(j===i)?(asc?' \u25B2':' \u25BC'):'';}"
+  "});})(i);}}"
+  "document.querySelectorAll('table.sortable').forEach(mk);})();</script>")
+
+def _dv(v):
+    """Escape a value for use inside a data-v=\"...\" attribute."""
+    if v is None: return ""
+    return (str(v).replace('&','&amp;').replace('"','&quot;').replace('<','&lt;').replace('>','&gt;'))
+
 def build_html(results, scanned, failed, scan_last_n=1, title="Bullish Reversal Screener", timeframe="Daily"):
     from datetime import datetime
     unit = "w" if str(timeframe).lower().startswith("w") else "d"
@@ -348,13 +374,28 @@ def build_html(results, scanned, failed, scan_last_n=1, title="Bullish Reversal 
                 badge=('<span class="vok">check vol</span>' if r['vol_confirmed'] else '<span class="vno">-</span>')
                 ago="today" if r['bars_ago']==0 else f"{r['bars_ago']}{unit} ago"
                 vr=f"{r['vol_ratio']}x" if r['vol_ratio'] is not None else "-"
-                trs+=(f"<tr><td class='sym'><a href='{tv_url(r['exch'],r['symbol'])}' "
+                mc_cr=r.get('mcap_cr')
+                trs+=(f"<tr><td class='sym' data-v=\"{_dv(r['symbol'])}\"><a href='{tv_url(r['exch'],r['symbol'])}' "
                       f"target='_blank' rel='noopener'>{r['symbol']}</a><span class='ex'>{r['exch']}</span></td>"
-                      f"<td>{r['close']}</td><td>{r['date']}<span class='ago'>{ago}</span></td>"
-                      f"<td>{vr} {badge}</td><td>{r['stop']}</td><td>{r['risk']}%</td>"
-                      f"<td>{r['target']}</td><td>{_mc(r.get('mcap_cr'))}</td><td class='note'>{r['note']}</td></tr>")
-            body=(f"<table><tr><th>Symbol</th><th>Close</th><th>Signal</th><th>Vol vs avg</th>"
-                  f"<th>Stop</th><th>Risk</th><th>2R target</th><th>Mkt Cap</th><th>Read</th></tr>{trs}</table>")
+                      f"<td data-v=\"{_dv(r['close'])}\">{r['close']}</td>"
+                      f"<td data-v=\"{_dv(r['bars_ago'])}\">{r['date']}<span class='ago'>{ago}</span></td>"
+                      f"<td data-v=\"{_dv(r['vol_ratio'])}\">{vr} {badge}</td>"
+                      f"<td data-v=\"{_dv(r['stop'])}\">{r['stop']}</td>"
+                      f"<td data-v=\"{_dv(r['risk'])}\">{r['risk']}%</td>"
+                      f"<td data-v=\"{_dv(r['target'])}\">{r['target']}</td>"
+                      f"<td data-v=\"{_dv(mc_cr)}\">{_mc(mc_cr)}</td>"
+                      f"<td class='note' data-v=\"{_dv(r['note'])}\">{r['note']}</td></tr>")
+            body=("<table class='sortable'><thead><tr>"
+                  "<th data-t='str'>Symbol<span class='ar'></span></th>"
+                  "<th data-t='num'>Close<span class='ar'></span></th>"
+                  "<th data-t='num'>Signal<span class='ar'></span></th>"
+                  "<th data-t='num'>Vol vs avg<span class='ar'></span></th>"
+                  "<th data-t='num'>Stop<span class='ar'></span></th>"
+                  "<th data-t='num'>Risk<span class='ar'></span></th>"
+                  "<th data-t='num'>2R target<span class='ar'></span></th>"
+                  "<th data-t='num'>Mkt Cap<span class='ar'></span></th>"
+                  "<th data-t='str'>Read<span class='ar'></span></th>"
+                  f"</tr></thead><tbody>{trs}</tbody></table>")
         else:
             body="<div class='empty'>No fresh signals in this category.</div>"
         panes+=(f'<div class="pane {active}" id="pane{idx}"><div class="phead"><h2>{name}</h2>'
@@ -392,15 +433,15 @@ th{{background:var(--panel);font-size:14px;text-transform:uppercase;letter-spaci
 .vok{{color:var(--green);font-weight:800}}.vno{{color:#aaa}}
 .empty{{padding:22px;background:var(--panel);border:1px dashed var(--line);border-radius:12px;color:var(--mut)}}
 .foot{{margin-top:34px;font-size:15px;color:var(--mut);background:var(--panel);border:1px solid var(--line);
-border-radius:12px;padding:16px 18px}}</style></head><body><div class="wrap">
+border-radius:12px;padding:16px 18px}}</style>{SORT_CSS}</head><body><div class="wrap">
 <h1>{title}</h1><p class="sub">Long-only &middot; tabs ordered by historical reversal frequency (highest first)</p>
 <div class="meta"><b>{today}</b> &middot; {timeframe} candles &middot; {scanned} stocks scanned &middot; <b>{total}</b> signals &middot;
 last {scan_last_n} bar(s). Win-% = historical best-case reversal frequency (a ranking aid, not a tradeable win-rate).</div>
-<div class="tabs">{tabs}</div>{panes}
+<div class="tabs">{tabs}</div><div class="sorthint">Tip: <b>tap any column header</b> to sort &mdash; tap again to reverse.</div>{panes}
 <div class="foot"><b>How to read:</b> strongest setups are volume-confirmed signals in the top tabs at a tested
 support level. Stop = pattern low; 2R target assumes entry at last close. Research tool, not investment advice.</div>
 <script>function show(i){{document.querySelectorAll('.tab').forEach((t,j)=>t.classList.toggle('active',j===i));
-document.querySelectorAll('.pane').forEach((p,j)=>p.classList.toggle('active',j===i));}}</script>
+document.querySelectorAll('.pane').forEach((p,j)=>p.classList.toggle('active',j===i));}}</script>{SORT_JS}
 </body></html>"""
 
 # ------------------------------------------------------------- self-test ----

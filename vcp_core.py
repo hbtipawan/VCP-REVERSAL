@@ -460,23 +460,46 @@ def build_vcp_html(rows, scanned, failed, timeframe="Daily", summary=""):
         btcss={"Ascending":"asc","Descending":"desc","HiTightFlag":"htf",
                "CupHandle":"cup","DarvasBox":"dvb","PocketPivot":"pp",
                "EpisodicPivot":"ep"}.get(bt_,"flat")
-        if bt_=="HiTightFlag" and r.get('pole') is not None: sl_=f"+{r['pole']:.0f}% pole"
-        elif r.get('slope') is not None: sl_=f"{r['slope']:+.2f}%/bar"
-        elif r.get('note'): sl_=r['note']
-        else: sl_="&mdash;"
-        trs+=(f"<tr><td><span class='grade' style='background:{gcol.get(g,'#445')}'>{g}</span></td>"
-              f"<td><span class='stt {stcss}'>{st_}</span></td>"
-              f"<td><span class='bt {btcss}'>{bt_}</span></td><td>{sl_}</td>"
-              f"<td class='sym'><a href='{sc.tv_url(r['exch'],r['symbol'])}' target='_blank' "
+        # numeric sort key for the Slope/Pole column (pole% if HTF, else slope)
+        if bt_=="HiTightFlag" and r.get('pole') is not None:
+            sl_=f"+{r['pole']:.0f}% pole"; sl_v=r['pole']
+        elif r.get('slope') is not None:
+            sl_=f"{r['slope']:+.2f}%/bar"; sl_v=r['slope']
+        elif r.get('note'):
+            sl_=r['note']; sl_v=None
+        else:
+            sl_="&mdash;"; sl_v=None
+        mc_cr=r.get('mcap_cr')
+        d=sc._dv
+        trs+=(f"<tr><td data-v=\"{d(g)}\"><span class='grade' style='background:{gcol.get(g,'#445')}'>{g}</span></td>"
+              f"<td data-v=\"{d(st_)}\"><span class='stt {stcss}'>{st_}</span></td>"
+              f"<td data-v=\"{d(bt_)}\"><span class='bt {btcss}'>{bt_}</span></td>"
+              f"<td data-v=\"{d(sl_v)}\">{sl_}</td>"
+              f"<td class='sym' data-v=\"{d(r['symbol'])}\"><a href='{sc.tv_url(r['exch'],r['symbol'])}' target='_blank' "
               f"rel='noopener'>{r['symbol']}</a><span class='ex'>{r['exch']}</span></td>"
-              f"<td>{r['close']}</td><td>{r['tightness']}%</td><td>{r['base_len']}</td>"
-              f"<td>{r['contraction']}</td><td>{r['dryup']}</td><td>{r['near_high']}%</td><td>{ld_}</td>"
-              f"<td>{r['rs']}%</td><td>{r['pivot']}</td><td>{r['dist_pivot']}%</td>"
-              f"<td>{r['vol_surge']}x</td><td>{r['stop']}</td><td>{r['target']}</td>"
-              f"<td>{_mc(r.get('mcap_cr'))}</td><td class='nm'>{r['name']}</td></tr>")
-    body=(f"<table><tr><th>Grade</th><th>Status</th><th>Type</th><th>Slope/Pole</th><th>Symbol</th><th>Close</th><th>Tight</th>"
-          f"<th>Base</th><th>Contr</th><th>Dry</th><th>Near hi</th><th>From low</th><th>RS</th><th>Pivot</th>"
-          f"<th>To pivot</th><th>Vol</th><th>Stop</th><th>2R tgt</th><th>Mkt Cap</th><th>Company</th></tr>{trs}</table>"
+              f"<td data-v=\"{d(r['close'])}\">{r['close']}</td>"
+              f"<td data-v=\"{d(r['tightness'])}\">{r['tightness']}%</td>"
+              f"<td data-v=\"{d(r['base_len'])}\">{r['base_len']}</td>"
+              f"<td data-v=\"{d(r['contraction'])}\">{r['contraction']}</td>"
+              f"<td data-v=\"{d(r['dryup'])}\">{r['dryup']}</td>"
+              f"<td data-v=\"{d(r['near_high'])}\">{r['near_high']}%</td>"
+              f"<td data-v=\"{d(r.get('low_dist'))}\">{ld_}</td>"
+              f"<td data-v=\"{d(r['rs'])}\">{r['rs']}%</td>"
+              f"<td data-v=\"{d(r['pivot'])}\">{r['pivot']}</td>"
+              f"<td data-v=\"{d(r['dist_pivot'])}\">{r['dist_pivot']}%</td>"
+              f"<td data-v=\"{d(r['vol_surge'])}\">{r['vol_surge']}x</td>"
+              f"<td data-v=\"{d(r['stop'])}\">{r['stop']}</td>"
+              f"<td data-v=\"{d(r['target'])}\">{r['target']}</td>"
+              f"<td data-v=\"{d(mc_cr)}\">{_mc(mc_cr)}</td>"
+              f"<td class='nm' data-v=\"{d(r['name'])}\">{r['name']}</td></tr>")
+    def _hh(label, t):
+        return f"<th data-t='{t}'>{label}<span class='ar'></span></th>"
+    _head=("".join([_hh("Grade","str"),_hh("Status","str"),_hh("Type","str"),_hh("Slope/Pole","num"),
+            _hh("Symbol","str"),_hh("Close","num"),_hh("Tight","num"),_hh("Base","num"),_hh("Contr","num"),
+            _hh("Dry","num"),_hh("Near hi","num"),_hh("From low","num"),_hh("RS","num"),_hh("Pivot","num"),
+            _hh("To pivot","num"),_hh("Vol","num"),_hh("Stop","num"),_hh("2R tgt","num"),
+            _hh("Mkt Cap","num"),_hh("Company","str")]))
+    body=(f"<table class='sortable'><thead><tr>{_head}</tr></thead><tbody>{trs}</tbody></table>"
           if rows else "<div class='empty'>No VCP candidates matched.</div>")
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>VCP Scanner</title><style>
@@ -502,9 +525,10 @@ th{{background:var(--panel);font-size:13px;text-transform:uppercase;color:var(--
 .bt.ep{{background:#fff3cd;color:#7a4f00}}
 .empty{{padding:22px;background:var(--panel);border:1px dashed var(--line);border-radius:12px;color:var(--mut)}}
 .foot{{margin-top:28px;font-size:15px;color:var(--mut);background:var(--panel);border:1px solid var(--line);
-border-radius:12px;padding:16px 18px}}</style></head><body><div class="wrap">
+border-radius:12px;padding:16px 18px}}</style>{sc.SORT_CSS}</head><body><div class="wrap">
 <h1>VCP Breakout Scanner</h1><p class="sub">Tight bases near the highs &middot; {timeframe} &middot; ranked by grade</p>
 <div class="meta"><b>{today}</b> &middot; {scanned} scanned &middot; <b>{len(rows)}</b> candidates &middot; {summary}</div>
+<div class="sorthint">Tip: <b>tap any column header</b> to sort &mdash; tap again to reverse.</div>
 {body}
 <div class="foot"><b>How to read:</b> <b>Coiling</b> = tight base under the pivot, ready; <b>Breakout</b> = today
 cleared the pivot on a volume surge (TARIL-type). <b>Type</b>: <b>Flat</b> = horizontal tight box;
@@ -520,7 +544,7 @@ event-day high, stop at the event-day low). <b>Slope</b> = trendline slope in %/
 Tight = base span %; Dry = base volume vs 50-bar avg (lower = quieter base); Contr = recent vs earlier range
 (lower = contracting); enter on a move through the Pivot, stop at base low. Grade reflects base quality;
 Ascending/Descending grades are heuristic and not yet backtested. Research tool, not investment advice.</div>
-</div></body></html>"""
+</div>{sc.SORT_JS}</body></html>"""
 
 def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
                    max_tight=0.05, min_base=3, strictness="Strict", max_workers=8,
