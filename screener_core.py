@@ -10,6 +10,51 @@
 
  EVERY detector enforces the LOCATION GATE: a bullish reversal is only valid
  after a prior DOWNTREND (and, for single-candle signals, near a recent LOW).
+
+ ---------------------------------------------------------------------------
+ AUDIT (Jul 2026) — false-positive paths closed. Tags in code: AUDIT FIX #n
+  #1  Baselines (body/range/volume averages) now use the PRIOR 14/20 bars,
+      excluding the signal bar. Before, a climax bar inflated its own average
+      (a true 5.0x volume spike was reported as 4.17x and the 2.0x climax
+      gate was silently ~2.11x).
+  #2  downtrend(): also requires EMA20 flat-or-falling. Before, a 4-day dip
+      inside a strong uptrend counted as a "prior downtrend".
+  #3  Hammer / Inverted Hammer: wick opposite the shadow capped at 15% of
+      range (was 30%) and the dominant shadow must be >= 50% of range.
+  #4  Bullish Engulfing (and the engulfing bar of Three Outside Up): the
+      engulfing body must be a real candle (>= 0.8x average body). Before,
+      a micro body "engulfing" another micro body fired.
+  #5  Piercing Line: textbook definition — the second candle must OPEN BELOW
+      THE PRIOR LOW (Nison/Bulkowski), not merely below the prior close.
+  #6  Tweezer Bottom: first candle must be bearish; both bars must have a
+      real range (>= 0.5x average). Before, two green candles or two
+      illiquid micro-dojis with tick-equal lows fired.
+  #7  Morning Star: star body must also be small in absolute terms
+      (<= 0.7x average body) and its body top must sit at/below the first
+      close (the 0.5% overlap grace is removed).
+  #8  Selling Climax: must CLOSE >= 25% off the low. Before, a crash bar
+      closing at its dead low (falling knife, no absorption) fired.
+  #9  No-Supply Bar: near_low is now enforced (module contract: single-candle
+      signals need a recent low) + volume must be > 0.
+  #10 Three Inside Up: harami bar capped at 0.6x of the first body — same
+      factor as d_bull_harami, so the two patterns agree on what a harami is.
+  #11 clean_df(): drops non-positive prices, duplicate dates, clamps
+      inconsistent high/low, and drops bad-tick bars whose range exceeds 50%
+      of close (beyond any NSE/BSE circuit band) — Yahoo glitch spikes were
+      manufacturing perfect "hammers".
+  #12 run_screen(): a raising fetch_fn no longer kills the whole scan — the
+      symbol is recorded in `failed` instead.
+  #13 Optional liquidity gate: analyze_df/run_screen accept
+      min_turnover_cr (avg traded value per bar, in Rs crore, computed as
+      close x avg-20-bar volume). Default 0 = off (behaviour unchanged).
+  #14 drop_partial_last(): optional helper (CLI --eod-only) to drop the
+      still-forming last daily/weekly bar so signals can't appear intraday
+      and vanish by the close.
+  #15 build_html(): symbol/name/note are now HTML-escaped in visible cells,
+      not just in the sort attributes.
+ Public API is unchanged: fetch_ohlcv, make_arrays, detectors, PATTERNS
+ (7-tuples), PATTERN_NAMES, analyze_df, run_screen, build_html, tv_url,
+ selftest. New kwargs all have defaults.
 ============================================================================
 """
 import sys, json, math, time, urllib.request, urllib.parse
@@ -54,6 +99,41 @@ def fetch_ohlcv(yahoo_symbol, rng=RANGE, interval="1d", retries=2):
         time.sleep(0.6*(attempt+1))   # backoff on rate-limit
     return None
 
+# ------------------------------------------------------------ data hygiene ----
+def clean_df(df):
+    """AUDIT FIX #11 — remove data artifacts that manufacture fake patterns:
+    non-positive OHLC, duplicated dates (Yahoo sometimes repeats the live bar),
+    high/low inconsistent with open/close (clamped), and bad-tick bars whose
+    range exceeds 50% of the close — beyond any NSE/BSE circuit band, so it is
+    a data error, not a candle."""
+    if df is None or not len(df): return df
+    d = df.drop_duplicates(subset="date", keep="last").copy()
+    for col in ("open", "high", "low", "close"):
+        d = d[d[col] > 0]
+    if not len(d): return None
+    d["high"] = d[["high", "open", "close"]].max(axis=1)
+    d["low"]  = d[["low",  "open", "close"]].min(axis=1)
+    d = d[(d["high"] - d["low"]) <= 0.50 * d["close"]]
+    return d.reset_index(drop=True) if len(d) else None
+
+def drop_partial_last(df, interval="1d", now=None):
+    """AUDIT FIX #14 — optionally drop the still-forming last bar so a signal
+    can't appear intraday and vanish by the close. Daily: drops today's bar if
+    it is before 15:35 IST. Weekly: drops the current (incomplete) week's bar
+    before Friday 15:35 IST. Off by default; used by the CLI --eod-only flag."""
+    if df is None or len(df) < 2: return df
+    now = now or pd.Timestamp.now(tz="Asia/Kolkata")
+    last = pd.Timestamp(df["date"].iloc[-1]).tz_localize(None)
+    if str(interval).startswith("1d"):
+        if last.date() == now.date() and (now.hour, now.minute) < (15, 35):
+            return df.iloc[:-1].reset_index(drop=True)
+    else:  # weekly
+        same_week = (last.isocalendar()[:2] == now.tz_localize(None).isocalendar()[:2])
+        before_fri_close = (now.weekday() < 4) or (now.weekday() == 4 and (now.hour, now.minute) < (15, 35))
+        if same_week and before_fri_close:
+            return df.iloc[:-1].reset_index(drop=True)
+    return df
+
 # ------------------------------------------------------------- indicators ----
 def make_arrays(df):
     o=df["open"].values.astype(float);  h=df["high"].values.astype(float)
@@ -61,15 +141,17 @@ def make_arrays(df):
     v=df["volume"].values.astype(float)
     body=np.abs(c-o); rng=h-l
     upsh=h-np.maximum(o,c); dnsh=np.minimum(o,c)-l
-    def sma(x,n): return pd.Series(x).rolling(n).mean().values
-    def ema(x,n): return pd.Series(x).ewm(span=n,adjust=False).mean().values
+    # AUDIT FIX #1: baselines exclude the current bar (prior-N averages), so a
+    # climax bar is measured against history it did not itself distort.
+    def psma(x,n): return pd.Series(x).rolling(n).mean().shift(1).values
+    def ema(x,n):  return pd.Series(x).ewm(span=n,adjust=False).mean().values
     pc=np.r_[np.nan, c[:-1]]
     tr=np.maximum.reduce([h-l, np.abs(h-pc), np.abs(l-pc)])
     atr=pd.Series(tr).ewm(alpha=1/14,adjust=False).mean().values
     return dict(o=o,h=h,l=l,c=c,v=v,body=body,rng=rng,upsh=upsh,dnsh=dnsh,
         bull=c>o, bear=c<o,
-        body_sma=sma(body,14), rng_sma=sma(rng,14), atr=atr,
-        ema20=ema(c,20), ema10=ema(c,10), vol_sma=sma(v,20),
+        body_sma=psma(body,14), rng_sma=psma(rng,14), atr=atr,
+        ema20=ema(c,20), ema10=ema(c,10), vol_sma=psma(v,20),
         low_min10=pd.Series(l).rolling(10).min().values,
         low_min10_prev=pd.Series(l).shift(1).rolling(10).min().values,
         n=len(c))
@@ -78,12 +160,22 @@ def make_arrays(df):
 def ok(x):           return x is not None and not (isinstance(x,float) and math.isnan(x))
 def long_body(A,i):  return ok(A['body_sma'][i]) and A['body_sma'][i]>0 and A['body'][i] > 1.3*A['body_sma'][i]
 def small_body(A,i): return ok(A['body_sma'][i]) and A['body_sma'][i]>0 and A['body'][i] < 0.6*A['body_sma'][i]
+def real_body(A,i,f=0.8):
+    """AUDIT FIX #4 — the bar must be a real candle, not micro-noise."""
+    return ok(A['body_sma'][i]) and A['body_sma'][i]>0 and A['body'][i] >= f*A['body_sma'][i]
+def real_range(A,i,f=0.5):
+    """AUDIT FIX #6 — the bar must have a meaningful range vs its history."""
+    return ok(A['rng_sma'][i]) and A['rng_sma'][i]>0 and A['rng'][i] >= f*A['rng_sma'][i]
 def doji(A,i):       return A['rng'][i]>0 and A['body'][i] <= 0.10*A['rng'][i]
 def near_low(A,i):
     m=A['low_min10'][i]; return ok(m) and A['l'][i] <= m*1.01
 def downtrend(A,r):
-    if r-5 < 0 or not ok(A['ema20'][r]): return False
-    return (A['c'][r] < A['ema20'][r]) and (A['c'][r] < A['c'][r-5])
+    """Short-term downtrend at reference bar r: close below EMA20, lower than
+    5 bars ago, AND EMA20 itself flat-or-falling (AUDIT FIX #2 — a brief dip
+    inside a rising-EMA20 uptrend is a pullback, not a prior downtrend)."""
+    if r-5 < 0 or not ok(A['ema20'][r]) or not ok(A['ema20'][r-2]): return False
+    return (A['c'][r] < A['ema20'][r]) and (A['c'][r] < A['c'][r-5]) \
+           and (A['ema20'][r] <= A['ema20'][r-2])
 def vol_conf(A,i):   return ok(A['vol_sma'][i]) and A['vol_sma'][i]>0 and A['v'][i] >= 1.5*A['vol_sma'][i]
 def midbody(A,i):    return (A['o'][i]+A['c'][i])/2.0
 
@@ -92,7 +184,9 @@ def d_hammer(A,i):
     if i<MIN_BARS: return None
     r=A['rng'][i]; b=A['body'][i]
     if r<=0 or b<=0.05*r or b>0.40*r: return None
-    if A['dnsh'][i] < 2*b or A['upsh'][i] > 0.30*r: return None
+    # AUDIT FIX #3: dominant lower shadow (>=50% of range) and a clean top
+    # (upper wick <=15% of range, was 30%).
+    if A['dnsh'][i] < max(2*b, 0.50*r) or A['upsh'][i] > 0.15*r: return None
     if not near_low(A,i) or not downtrend(A,i-1): return None
     return dict(stop=A['l'][i], note=f"Lower shadow {A['dnsh'][i]/max(b,1e-9):.1f}x body; lows rejected.")
 
@@ -100,7 +194,8 @@ def d_inverted_hammer(A,i):
     if i<MIN_BARS: return None
     r=A['rng'][i]; b=A['body'][i]
     if r<=0 or b<=0.05*r or b>0.40*r: return None
-    if A['upsh'][i] < 2*b or A['dnsh'][i] > 0.30*r: return None
+    # AUDIT FIX #3 (mirror): dominant upper shadow, clean bottom.
+    if A['upsh'][i] < max(2*b, 0.50*r) or A['dnsh'][i] > 0.15*r: return None
     if not near_low(A,i) or not downtrend(A,i-1): return None
     return dict(stop=A['l'][i], note="Long upper shadow at a low; needs up-close confirm next bar.")
 
@@ -118,31 +213,42 @@ def d_bull_engulf(A,i):
     if not (A['o'][i] <= A['c'][i-1] and A['c'][i] >= A['o'][i-1]): return None
     if not (A['o'][i] < A['c'][i-1] or A['c'][i] > A['o'][i-1]): return None
     if A['body'][i] <= A['body'][i-1]: return None
+    if not real_body(A,i): return None            # AUDIT FIX #4
     if not downtrend(A,i-2): return None
     return dict(stop=min(A['l'][i-1],A['l'][i]), note="Green body fully engulfs prior red body.")
 
 def d_piercing(A,i):
     if i<MIN_BARS+1: return None
     if not (A['bear'][i-1] and long_body(A,i-1) and A['bull'][i]): return None
-    if not (A['o'][i] < A['c'][i-1]): return None
+    # AUDIT FIX #5: textbook piercing OPENS BELOW THE PRIOR LOW (gap down).
+    if not (A['o'][i] < A['l'][i-1]): return None
     if not (A['c'][i] > midbody(A,i-1) and A['c'][i] < A['o'][i-1]): return None
     if not downtrend(A,i-2): return None
-    return dict(stop=min(A['l'][i-1],A['l'][i]), note="Closes above midpoint of prior long red.")
+    return dict(stop=min(A['l'][i-1],A['l'][i]), note="Gaps below prior low, closes above midpoint of the long red.")
 
 def d_tweezer_bottom(A,i):
     if i<MIN_BARS+1: return None
     tol = 0.0025*A['c'][i]          # lows must match within ~0.25% of price (tight)
     if abs(A['l'][i-1]-A['l'][i]) > tol: return None
-    if not A['bull'][i]: return None
+    # AUDIT FIX #6: first candle bearish (the down-thrust), second bullish
+    # (the rejection), and both bars must be real bars — kills tick-equal
+    # lows on illiquid micro-candles.
+    if not (A['bear'][i-1] and A['bull'][i]): return None
+    if not (real_range(A,i) and real_range(A,i-1)): return None
+    if A['v'][i] <= 0: return None
     if not near_low(A,i) or not downtrend(A,i-2): return None
-    return dict(stop=min(A['l'][i-1],A['l'][i]), note="Two candles reject the same low.")
+    return dict(stop=min(A['l'][i-1],A['l'][i]), note="Red then green reject the same low.")
 
 def d_morning_star(A,i):
     if i<MIN_BARS+2: return None
     c1,c2,c3=i-2,i-1,i
     if not (A['bear'][c1] and long_body(A,c1)): return None
+    # AUDIT FIX #7: a star is small both vs the first candle AND in absolute
+    # terms; its body top must sit at/below the first close (grace removed).
     if A['body'][c2] >= 0.5*A['body'][c1]: return None
-    if max(A['o'][c2],A['c'][c2]) > A['c'][c1]*1.005: return None
+    if not (ok(A['body_sma'][c2]) and A['body_sma'][c2]>0
+            and A['body'][c2] <= 0.7*A['body_sma'][c2]): return None
+    if max(A['o'][c2],A['c'][c2]) > A['c'][c1]: return None
     if not (A['bull'][c3] and A['c'][c3] > midbody(A,c1)): return None
     if not downtrend(A,c1-1): return None
     return dict(stop=min(A['l'][c1],A['l'][c2],A['l'][c3]), note="Star low + strong close into the red body.")
@@ -156,7 +262,7 @@ def d_three_white(A,i):
     if not (min(A['o'][b],A['c'][b]) <= A['o'][cc] <= max(A['o'][b],A['c'][b])): return None
     for j in (a,b,cc):
         if A['body'][j] <= 0 or A['upsh'][j] > 0.35*A['body'][j]: return None
-        if not (A['body_sma'][j]>0 and A['body'][j] > 0.5*A['body_sma'][j]): return None
+        if not (ok(A['body_sma'][j]) and A['body_sma'][j]>0 and A['body'][j] > 0.5*A['body_sma'][j]): return None
     if not downtrend(A,a-1): return None
     return dict(stop=min(A['l'][a],A['l'][b],A['l'][cc]), note="Three rising soldiers off a low.")
 
@@ -165,6 +271,7 @@ def d_three_inside_up(A,i):
     c1,c2,c3=i-2,i-1,i
     if not (A['bear'][c1] and long_body(A,c1)): return None
     if not (A['bull'][c2] and A['o'][c2] > A['c'][c1] and A['c'][c2] < A['o'][c1]): return None
+    if A['body'][c2] >= 0.6*A['body'][c1]: return None   # AUDIT FIX #10 (matches d_bull_harami)
     if not (A['bull'][c3] and A['c'][c3] > A['o'][c1]): return None
     if not downtrend(A,c1-1): return None
     return dict(stop=min(A['l'][c1],A['l'][c2],A['l'][c3]), note="Bullish harami + up-close confirmation.")
@@ -174,6 +281,7 @@ def d_three_outside_up(A,i):
     c1,c2,c3=i-2,i-1,i
     if not (A['bear'][c1] and A['bull'][c2]): return None
     if not (A['o'][c2] <= A['c'][c1] and A['c'][c2] >= A['o'][c1] and A['body'][c2]>A['body'][c1]): return None
+    if not real_body(A,c2): return None           # AUDIT FIX #4 (same bar quality as d_bull_engulf)
     if not (A['bull'][c3] and A['c'][c3] > A['c'][c2]): return None
     if not downtrend(A,c1-1): return None
     return dict(stop=min(A['l'][c1],A['l'][c2],A['l'][c3]), note="Engulfing + higher confirmation close.")
@@ -208,12 +316,17 @@ def d_bull_harami(A,i):
 
 def d_selling_climax(A,i):
     if i<MIN_BARS: return None
-    if not (ok(A['rng_sma'][i]) and A['rng'][i] >= 1.5*A['rng_sma'][i]): return None
+    r=A['rng'][i]
+    if r<=0: return None
+    if not (ok(A['rng_sma'][i]) and A['rng_sma'][i]>0 and r >= 1.5*A['rng_sma'][i]): return None
     if not (ok(A['vol_sma'][i]) and A['vol_sma'][i]>0 and A['v'][i] >= 2.0*A['vol_sma'][i]): return None
-    if not (A['bear'][i] or (A['rng'][i]>0 and A['dnsh'][i] >= 0.40*A['rng'][i])): return None
-    if A['rng'][i]>0 and A['upsh'][i] > 0.35*A['rng'][i]: return None   # reject upthrust (upper-wick dominated)
+    # AUDIT FIX #8: capitulation must show ABSORPTION — close >= 25% off the
+    # low. A wide bar closing at its dead low is a falling knife, not a
+    # selling climax, and gets rejected.
+    if (A['c'][i] - A['l'][i]) < 0.25*r: return None
+    if A['upsh'][i] > 0.35*r: return None   # reject upthrust (upper-wick dominated)
     if not near_low(A,i) or not downtrend(A,i-1): return None
-    return dict(stop=A['l'][i], note=f"Wide bar on {A['v'][i]/A['vol_sma'][i]:.1f}x volume - capitulation.")
+    return dict(stop=A['l'][i], note=f"Wide bar on {A['v'][i]/A['vol_sma'][i]:.1f}x volume - capitulation, close off lows.")
 
 def d_stopping_volume(A,i):
     if i<MIN_BARS: return None
@@ -229,10 +342,13 @@ def d_stopping_volume(A,i):
 def d_no_supply(A,i):
     if i<MIN_BARS: return None
     if not A['bear'][i]: return None
-    if not (ok(A['rng_sma'][i]) and A['rng'][i] <= 0.70*A['rng_sma'][i]): return None
-    if not (ok(A['vol_sma'][i]) and A['v'][i] <= 0.70*A['vol_sma'][i]): return None
+    if not (ok(A['rng_sma'][i]) and A['rng_sma'][i]>0 and A['rng'][i] <= 0.70*A['rng_sma'][i]): return None
+    # AUDIT FIX #9: volume must exist and baseline must be positive.
+    if not (ok(A['vol_sma'][i]) and A['vol_sma'][i]>0 and 0 < A['v'][i] <= 0.70*A['vol_sma'][i]): return None
     if not (A['v'][i] < A['v'][i-1] and A['v'][i] < A['v'][i-2]): return None
-    if not downtrend(A,i-1): return None
+    # AUDIT FIX #9: single-candle signal — enforce the near-low location gate
+    # the module (and the report's own gate line) promises.
+    if not near_low(A,i) or not downtrend(A,i-1): return None
     return dict(stop=A['l'][i], note="Narrow down-bar on dried-up volume - no sellers left.")
 
 # ------------------------------------------------------ pattern registry ----
@@ -253,13 +369,13 @@ PATTERNS = [
  ("Bullish Engulfing",      63, True,  "A", d_bull_engulf,       2,
    "Green body fully engulfs the prior red body after a decline."),
  ("Piercing Line",          62, False, "B", d_piercing,          2,
-   "Green opens below prior close, then closes above the midpoint of the red body."),
+   "Green opens below the prior LOW, then closes above the midpoint of the red body."),
  ("Hammer",                 60, True,  "B", d_hammer,            1,
    "Small body, long lower shadow at a low - lows rejected."),
  ("Tweezer Bottom",         58, False, "B", d_tweezer_bottom,    2,
-   "Two candles share the same low - a double rejection."),
+   "Red then green candle share the same low - a double rejection."),
  ("Selling Climax",         57, False, "A", d_selling_climax,    1,
-   "Wide-range bar on huge volume at the end of a decline - capitulation."),
+   "Wide-range bar on huge volume at the end of a decline, closing off the lows - capitulation."),
  ("Stopping Volume / Spring",56,False, "A", d_stopping_volume,   1,
    "New low absorbed on heavy volume, close off the lows."),
  ("Inverted Hammer",        56, False, "C", d_inverted_hammer,   1,
@@ -267,7 +383,7 @@ PATTERNS = [
  ("Bullish Harami",         54, True,  "C", d_bull_harami,       2,
    "Small green inside a long red - early momentum-shift warning."),
  ("No-Supply Bar",          53, False, "A", d_no_supply,         1,
-   "Narrow down-bar on dried-up volume - sellers exhausted (VSA)."),
+   "Narrow down-bar on dried-up volume near a low - sellers exhausted (VSA)."),
  ("Dragonfly Doji",         52, False, "C", d_dragonfly,         1,
    "Long lower shadow, open=close=high at support."),
 ]
@@ -275,11 +391,19 @@ PATTERNS.sort(key=lambda p:-p[1])
 PATTERN_NAMES = [p[0] for p in PATTERNS]
 
 # --------------------------------------------------------- analysis core ----
-def analyze_df(df, row, scan_last_n=1):
-    """Return list of (pattern_name, match_dict) found on the last scan_last_n bars."""
+def analyze_df(df, row, scan_last_n=1, min_turnover_cr=0.0):
+    """Return list of (pattern_name, match_dict) found on the last scan_last_n bars.
+    min_turnover_cr (AUDIT FIX #13): skip the symbol when average traded value
+    per bar (close x avg-20-bar volume) is below this many Rs crore. 0 = off."""
     out=[]
+    if df is None: return out
+    df = clean_df(df)                              # AUDIT FIX #11
     if df is None or len(df) < MIN_BARS+5: return out
     A=make_arrays(df); n=A['n']
+    if min_turnover_cr and min_turnover_cr > 0:
+        vs = A['vol_sma'][n-1]
+        if not (ok(vs) and vs > 0): return out
+        if A['c'][n-1]*vs/1e7 < min_turnover_cr: return out
     for name,wp,src,tier,fn,plen,lit in PATTERNS:
         for back in range(scan_last_n):
             i=n-1-back
@@ -301,7 +425,8 @@ def analyze_df(df, row, scan_last_n=1):
                 break
     return out
 
-def run_screen(rows, fetch_fn=None, scan_last_n=1, max_workers=8, progress=None, request_delay=0.0):
+def run_screen(rows, fetch_fn=None, scan_last_n=1, max_workers=8, progress=None,
+               request_delay=0.0, min_turnover_cr=0.0):
     """rows: list of dicts (need whatever fetch_fn reads, e.g. security_id or yahoo).
     fetch_fn(row)->df|None. progress: callable(done,total,label). Returns (results,scanned,failed)."""
     fetch_fn = fetch_fn or (lambda row: fetch_ohlcv(row["yahoo"]))
@@ -309,16 +434,22 @@ def run_screen(rows, fetch_fn=None, scan_last_n=1, max_workers=8, progress=None,
     scanned=0; failed=[]; total=len(rows); done=0
     def work(row):
         if request_delay: time.sleep(request_delay)
-        return row, fetch_fn(row)
+        try:
+            return row, fetch_fn(row)              # AUDIT FIX #12
+        except PermissionError:
+            raise                                  # auth errors must surface (app catches these)
+        except Exception:
+            return row, None
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs=[ex.submit(work,r) for r in rows]
         for fut in as_completed(futs):
             row,df=fut.result(); done+=1
+            df=clean_df(df)
             if df is None or len(df) < MIN_BARS+5:
                 failed.append(row["symbol"])
             else:
                 scanned+=1
-                for name,m in analyze_df(df,row,scan_last_n):
+                for name,m in analyze_df(df,row,scan_last_n,min_turnover_cr=min_turnover_cr):
                     results[name].append(m)
             if progress: progress(done,total,row["symbol"])
     for name in results:
@@ -348,7 +479,7 @@ SORT_JS = ("<script>(function(){"
   "document.querySelectorAll('table.sortable').forEach(mk);})();</script>")
 
 def _dv(v):
-    """Escape a value for use inside a data-v=\"...\" attribute."""
+    """Escape a value for HTML text / attribute use."""
     if v is None: return ""
     return (str(v).replace('&','&amp;').replace('"','&quot;').replace('<','&lt;').replace('>','&gt;'))
 
@@ -375,8 +506,9 @@ def build_html(results, scanned, failed, scan_last_n=1, title="Bullish Reversal 
                 ago="today" if r['bars_ago']==0 else f"{r['bars_ago']}{unit} ago"
                 vr=f"{r['vol_ratio']}x" if r['vol_ratio'] is not None else "-"
                 mc_cr=r.get('mcap_cr')
+                # AUDIT FIX #15: visible cells escaped, not just sort attributes.
                 trs+=(f"<tr><td class='sym' data-v=\"{_dv(r['symbol'])}\"><a href='{tv_url(r['exch'],r['symbol'])}' "
-                      f"target='_blank' rel='noopener'>{r['symbol']}</a><span class='ex'>{r['exch']}</span></td>"
+                      f"target='_blank' rel='noopener'>{_dv(r['symbol'])}</a><span class='ex'>{_dv(r['exch'])}</span></td>"
                       f"<td data-v=\"{_dv(r['close'])}\">{r['close']}</td>"
                       f"<td data-v=\"{_dv(r['bars_ago'])}\">{r['date']}<span class='ago'>{ago}</span></td>"
                       f"<td data-v=\"{_dv(r['vol_ratio'])}\">{vr} {badge}</td>"
@@ -384,7 +516,7 @@ def build_html(results, scanned, failed, scan_last_n=1, title="Bullish Reversal 
                       f"<td data-v=\"{_dv(r['risk'])}\">{r['risk']}%</td>"
                       f"<td data-v=\"{_dv(r['target'])}\">{r['target']}</td>"
                       f"<td data-v=\"{_dv(mc_cr)}\">{_mc(mc_cr)}</td>"
-                      f"<td class='note' data-v=\"{_dv(r['note'])}\">{r['note']}</td></tr>")
+                      f"<td class='note' data-v=\"{_dv(r['note'])}\">{_dv(r['note'])}</td></tr>")
             body=("<table class='sortable'><thead><tr>"
                   "<th data-t='str'>Symbol<span class='ar'></span></th>"
                   "<th data-t='num'>Close<span class='ar'></span></th>"
@@ -459,17 +591,18 @@ def _uplead(n=45,start=120.0,step=1.2):
     return seq
 def selftest():
     fails=[]
-    def check(name,lead,tail,det,should=True):
+    def check(name,lead,tail,det,should=True,label=""):
         A=make_arrays(_df(lead+tail));i=A['n']-1
         got=det(A,i) is not None
-        if got!=should: fails.append(name+("" if should else " (control)"))
-        print(f"  {'OK ' if got==should else 'FAIL'} {name}{'' if should else ' [uptrend->reject]'}")
+        tag=f"{name}{' - '+label if label else ''}"
+        if got!=should: fails.append(tag)
+        print(f"  {'OK ' if got==should else 'FAIL'} {tag}{'' if should else ' [must reject]'}")
+
+    print("-- positives (textbook shapes after a downtrend) --")
     check("Hammer",_downlead(),[(145.0,146.3,140.0,146.0,120000)],d_hammer)
-    check("Hammer",_uplead(),[(145.0,146.3,140.0,146.0,120000)],d_hammer,should=False)
     check("Inverted Hammer",_downlead(),[(145,151,144.7,145.6,120000)],d_inverted_hammer)
     check("Dragonfly Doji",_downlead(),[(145.5,145.6,140,145.5,120000)],d_dragonfly)
     check("Bullish Engulfing",_downlead(),[(146,146.5,143,143.5,90000),(143,149,142.5,148.5,150000)],d_bull_engulf)
-    check("Bullish Engulfing",_uplead(),[(146,146.5,143,143.5,90000),(143,149,142.5,148.5,150000)],d_bull_engulf,should=False)
     check("Piercing Line",_downlead(),[(148,148.5,141,141.5,90000),(140,145.6,139.5,145.5,150000)],d_piercing)
     check("Tweezer Bottom",_downlead(),[(146,146.5,142.0,142.5,90000),(142.6,147,142.02,146.8,150000)],d_tweezer_bottom)
     check("Morning Star",_downlead(),[(148,148.5,141,141.5,90000),(140.5,141,139.5,140.0,60000),(140.5,147,140.2,146.5,150000)],d_morning_star)
@@ -479,9 +612,61 @@ def selftest():
     check("Three Line Strike",_downlead(),[(150,150.5,147,147.5,90000),(147.5,148,144,144.5,90000),(144.5,145,141,141.5,90000),(141,151,140.5,150.5,160000)],d_three_line_strike)
     check("Bullish Abandoned Baby",_downlead(),[(148,148.5,143,143.5,90000),(141,141.3,140.7,141.0,60000),(143,147,142.6,146.5,150000)],d_abandoned_baby)
     check("Bullish Harami",_downlead(),[(150,150.5,141,141.5,90000),(143,145,142.8,144.5,70000)],d_bull_harami)
-    check("Selling Climax",_downlead(),[(146,146.5,135,136,400000)],d_selling_climax)
+    check("Selling Climax",_downlead(),[(146,146.5,134,138,400000)],d_selling_climax)
     check("Stopping Volume / Spring",_downlead(),[(144,144.5,135,143.0,400000)],d_stopping_volume)
     check("No-Supply Bar",_downlead(),[(145,145.3,144.6,144.8,30000)],d_no_supply)
+
+    print("-- negatives: uptrend context (location gate) --")
+    check("Hammer",_uplead(),[(145.0,146.3,140.0,146.0,120000)],d_hammer,False,"uptrend")
+    check("Bullish Engulfing",_uplead(),[(146,146.5,143,143.5,90000),(143,149,142.5,148.5,150000)],d_bull_engulf,False,"uptrend")
+    check("Morning Star",_uplead(),[(148,148.5,141,141.5,90000),(140.5,141,139.5,140.0,60000),(140.5,147,140.2,146.5,150000)],d_morning_star,False,"uptrend")
+    check("Selling Climax",_uplead(),[(146,146.5,134,138,400000)],d_selling_climax,False,"uptrend")
+
+    print("-- negatives: shape violations (AUDIT FIX regression guards) --")
+    check("Tweezer Bottom",_downlead(),[(142.6,146.0,142.00,145.2,110000),(142.8,147,142.02,146.5,130000)],
+          d_tweezer_bottom,False,"two green candles")
+    check("Tweezer Bottom",_downlead(),[(144.0,144.1,143.95,144.0,5000),(144.0,144.12,143.95,144.02,4000)],
+          d_tweezer_bottom,False,"two micro-dojis")
+    check("Tweezer Bottom",_downlead(),[(146,146.5,142.0,142.5,90000),(142.6,147,143.5,146.8,150000)],
+          d_tweezer_bottom,False,"lows do not match")
+    check("Selling Climax",_downlead(),[(146,146.5,133,133.2,500000)],d_selling_climax,False,"close at dead low")
+    check("Piercing Line",_downlead(),[(148,148.5,141,141.5,90000),(141.2,146,140.8,145.5,150000)],
+          d_piercing,False,"open above prior low")
+    check("Piercing Line",_downlead(),[(148,148.5,141,141.5,90000),(140,145.6,139.5,144.0,150000)],
+          d_piercing,False,"close below midpoint")
+    check("Morning Star",_downlead(),[(150,150.5,141,141.5,90000),(141.0,141.6,137.8,138.0,80000),(140,147.5,139.8,147.0,150000)],
+          d_morning_star,False,"star body 2.5x avg")
+    check("Bullish Engulfing",_downlead(),[(145.90,146.05,145.75,145.82,100000),(145.80,146.00,145.70,145.95,101000)],
+          d_bull_engulf,False,"micro engulfs micro")
+    check("Hammer",_downlead(),[(144.2,146.0,140.0,144.6,120000)],d_hammer,False,"upper wick 28% of range")
+    check("Inverted Hammer",_downlead(),[(145,150,141,145.6,120000)],d_inverted_hammer,False,"big lower tail")
+
+    print("-- negatives: trend-gate strictness (dip inside strong uptrend) --")
+    up=_uplead(40,100.0,1.5)
+    dip=[(160.0,160.3,156.7,157.0,100000),(157.0,157.3,153.7,154.0,100000),
+         (154.0,154.3,150.7,151.0,100000),(151.0,151.3,147.7,148.0,100000),
+         (147.0,148.2,142.5,148.0,120000)]
+    check("Hammer",up,dip,d_hammer,False,"4-day dip, EMA20 still rising")
+
+    print("-- negatives: near-low gate on single-candle signals --")
+    lead=_downlead(40)
+    bounce=[];p=lead[-1][3]
+    for _ in range(2):
+        o=p;c=p+1.0;bounce.append((o,c+0.2,o-0.2,c,100000));p=c
+    check("No-Supply Bar",lead,bounce+[(153.9,153.95,153.45,153.55,30000)],
+          d_no_supply,False,"1.2% above the 10-bar low")
+
+    print("-- gate unit checks --")
+    A=make_arrays(_df(_downlead()+[(146,146.5,143,143.5,90000),(143.5,146,143.2,144.5,90000)]))
+    g1=downtrend(A,A['n']-1)                      # decline + 2 weak bars: still a downtrend
+    A2=make_arrays(_df(_uplead(40,100.0,1.5)+dip[:4]))
+    g2=downtrend(A2,A2['n']-1)                    # sharp dip, EMA20 rising: NOT a downtrend
+    for nm,got,want in (("downtrend holds after weak bounce",g1,True),
+                        ("downtrend rejects rising-EMA20 dip",g2,False)):
+        okk = got==want
+        if not okk: fails.append(nm)
+        print(f"  {'OK ' if okk else 'FAIL'} {nm}")
+
     print(f"\nSelf-test: {'ALL PASS' if not fails else 'FAILURES: '+', '.join(fails)}")
     return not fails
 

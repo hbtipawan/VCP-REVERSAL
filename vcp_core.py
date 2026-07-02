@@ -10,6 +10,15 @@ Quality logic (Minervini SEPA-inspired):
          a TIGHT final base (span <= max_tight, default 5%).
   CLASSIFY: "Coiling" (price sitting just under the pivot) or
             "Breakout" (today clears a prior tight base on a volume surge).
+
+AUDIT (Jul 2026) — correctness-only fixes, tagged AUDIT FIX V1-V5 in code.
+No backtest-calibrated threshold, weight or measurement was changed (incl.
+the vol50 convention the 2,072-trade backtest was calibrated against).
+V1 tight_base stops at NaN bars. V2 a penetrated Darvas box is dead.
+V3 EP-score local renamed (shadowed the screener_core import). V4 scan
+survives a raising fetch_fn (PermissionError still surfaces), weekly
+short-history floor 40 bars, glitch bars stripped via sc.clean_df.
+V5 HTML report escapes visible symbol/company cells. `selftest()` added.
   GRADE A/B/C from: tightness, volatility contraction, volume dry-up,
             proximity to high, base length, relative strength vs Nifty.
 """
@@ -36,8 +45,13 @@ def tight_base(A, end, max_tight):
     """Walk backward from `end` while the running high-low span stays <= max_tight*close.
     Only bars within the tight band are counted. Returns (#bars, pivot_high, base_low)."""
     c=A['c'][end]; hi=A['h'][end]; lo=A['l'][end]; k=1
-    if c<=0 or (hi-lo)/c > max_tight: return 0, hi, lo
+    # AUDIT FIX V1: a NaN bar must END the base, not be silently skipped —
+    # max(x, nan) keeps x, so the old walk certified tightness across bars
+    # whose true high/low is unknown (feed gaps).
+    if c<=0 or not (np.isfinite(hi) and np.isfinite(lo)) or (hi-lo)/c > max_tight:
+        return 0, hi, lo
     for j in range(end-1, max(-1, end-40), -1):
+        if not (np.isfinite(A['h'][j]) and np.isfinite(A['l'][j])): break
         nhi=max(hi,A['h'][j]); nlo=min(lo,A['l'][j])
         if (nhi-nlo)/c > max_tight: break
         hi,lo=nhi,nlo; k+=1
@@ -217,6 +231,11 @@ def darvas_box(A, end, c, vol50, conf=3, max_age=60, min_pct=0.03, max_pct=0.40)
     if cf is None: return None
     box_bot=float(l[cf])
     if box_bot<=0 or box_top<=box_bot: return None
+    # AUDIT FIX V2 (Darvas's own rule): any penetration kills the box. The
+    # ceiling search starts at end-conf, so a spike in the last conf bars
+    # could otherwise leave a stale, already-broken box reading as "Coiling".
+    if float(np.nanmax(h[ct+1:end+1])) > box_top: return None
+    if float(np.nanmin(l[cf:end+1]))  < box_bot: return None
     box_pct=(box_top-box_bot)/box_bot
     if box_pct<min_pct or box_pct>max_pct: return None
     dry=float(np.nanmean(v[ct:end+1]))/vol50 if (_ok(vol50) and vol50>0) else 1.0
@@ -326,13 +345,16 @@ def analyze_vcp(df, row, timeframe="Daily", near_high_pct=0.12, max_tight=0.05,
             dl_e=(c/lo52e-1.0)*100.0 if (_ok(lo52e) and lo52e>0) else None
             mom=p['mom']; sret=(c/A['c'][i-mom]-1) if i-mom>=0 and A['c'][i-mom]>0 else 0.0
             rs_e=sret-(nifty_mom_ret or 0.0)
-            sc=round(25*float(np.clip(ep['move']/0.20,0,1)) + 25*float(np.clip(ep['volr']/6.0,0,1))
+            # AUDIT FIX V3: local was named `sc`, shadowing the screener_core
+            # module import inside this function — a latent UnboundLocalError
+            # landmine for any future edit. Same numbers, safe name.
+            ep_sc=round(25*float(np.clip(ep['move']/0.20,0,1)) + 25*float(np.clip(ep['volr']/6.0,0,1))
                      + 15*float(np.clip(max(ep['gap'],0)/0.12,0,1))
                      + 15*float(np.clip(1-ep['contr']/max(ep_dorm_max,1e-9),0,1))
                      + 20*float(np.clip(ep['close_pos'],0,1)))
-            gr="A" if sc>=75 else "B" if sc>=60 else "C"
+            gr="A" if ep_sc>=75 else "B" if ep_sc>=60 else "C"
             return dict(symbol=row['symbol'], name=row.get('name',''), exch=row.get('exch',''),
-                sector=row.get('sector',''), close=round(c,2), status="Breakout", grade=gr, score=sc,
+                sector=row.get('sector',''), close=round(c,2), status="Breakout", grade=gr, score=ep_sc,
                 base_len=int(ep['bk']), tightness=round(ep['tight']*100,1),
                 contraction=round(ep['contr'],2), dryup=round(ep['dry'],2),
                 near_high=round(nh_e*100,1), low_dist=(round(dl_e,1) if dl_e is not None else None),
@@ -496,7 +518,7 @@ def build_vcp_html(rows, scanned, failed, timeframe="Daily", summary=""):
               f"{'<span class=sh title=\"short trading history \u2014 52-week metrics use fewer bars\"> \u26a0</span>' if r.get('short_hist') else ''}</td>"
               f"<td data-v=\"{d(sl_v)}\">{sl_}</td>"
               f"<td class='sym' data-v=\"{d(r['symbol'])}\"><a href='{sc.tv_url(r['exch'],r['symbol'])}' target='_blank' "
-              f"rel='noopener'>{r['symbol']}</a><span class='ex'>{r['exch']}</span></td>"
+              f"rel='noopener'>{d(r['symbol'])}</a><span class='ex'>{d(r['exch'])}</span></td>"
               f"<td data-v=\"{d(r['close'])}\">{r['close']}</td>"
               f"<td data-v=\"{d(r['tightness'])}\">{r['tightness']}%</td>"
               f"<td data-v=\"{d(r['base_len'])}\">{r['base_len']}</td>"
@@ -511,7 +533,7 @@ def build_vcp_html(rows, scanned, failed, timeframe="Daily", summary=""):
               f"<td data-v=\"{d(r['stop'])}\">{r['stop']}</td>"
               f"<td data-v=\"{d(r['target'])}\">{r['target']}</td>"
               f"<td data-v=\"{d(mc_cr)}\">{_mc(mc_cr)}</td>"
-              f"<td class='nm' data-v=\"{d(r['name'])}\">{r['name']}</td></tr>")
+              f"<td class='nm' data-v=\"{d(r['name'])}\">{d(r['name'])}</td></tr>")
     def _hh(label, t):
         return f"<th data-t='{t}'>{label}<span class='ar'></span></th>"
     _head=("".join([_hh("Grade","str"),_hh("Status","str"),_hh("Type","str"),_hh("Slope/Pole","num"),
@@ -584,12 +606,23 @@ def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
     out=[]; scanned=0; failed=[]; total=len(rows); done=0
     def work(r):
         if request_delay: time.sleep(request_delay)
-        return r, fetch_fn(r)
+        try:
+            return r, fetch_fn(r)               # AUDIT FIX V4a: one bad symbol
+        except PermissionError:                 # must not kill the whole scan;
+            raise                               # auth errors still surface.
+        except Exception:
+            return r, None
+    _clean = getattr(sc, "clean_df", None)      # AUDIT FIX V4b: strip glitch bars
+    # AUDIT FIX V4c: analyze_vcp's documented short-history floor is 40 bars on
+    # Weekly (60 on Daily); the old hard 60 silently dropped ~10-month-old
+    # listings from weekly scans as "failed".
+    min_need = 40 if timeframe == "Weekly" else 60
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs=[ex.submit(work,r) for r in rows]
         for fut in as_completed(futs):
             r,df=fut.result(); done+=1
-            if df is None or len(df)<60: failed.append(r["symbol"])
+            if _clean is not None and df is not None: df=_clean(df)
+            if df is None or len(df)<min_need: failed.append(r["symbol"])
             else:
                 scanned+=1
                 try: m=analyze_vcp(df,r,timeframe,near_high_pct,max_tight,min_base,strictness,nifty_ret,
@@ -609,9 +642,80 @@ def run_vcp_screen(rows, fetch_fn=None, timeframe="Daily", near_high_pct=0.12,
     return out, scanned, failed
 
 
+# ------------------------------------------------------------- self-test ----
+def _mkdf(bars):
+    return pd.DataFrame(dict(date=pd.date_range("2025-01-01",periods=len(bars),freq="D"),
+        open=[b[0] for b in bars], high=[b[1] for b in bars], low=[b[2] for b in bars],
+        close=[b[3] for b in bars], volume=[b[4] for b in bars]))
+def _uptrend(n=285, lo=60.0, hi=100.0, vol=100000):
+    bars=[]; step=(hi-lo)/n; p=lo
+    for _ in range(n):
+        o=p; c=p+step; bars.append((o,c+0.4,o-0.4,c,vol)); p=c
+    return bars
+def selftest():
+    """Synthetic regression guards for the AUDIT FIX V1-V4 behaviours. Purely
+    additive: run with `python3 vcp_core.py --selftest` (no network needed)."""
+    fails=[]
+    def chk(name, cond):
+        if not cond: fails.append(name)
+        print(f"  {'OK ' if cond else 'FAIL'} {name}")
+    row=dict(symbol="TEST",name="Test",exch="NSE")
+    def darvas_case(spike):
+        tail=[(96.0,97.0,95.5,96.5,150000),(96.5,97.5,96.0,97.0,150000),
+              (97.0,98.5,96.5,98.0,150000),(98.0,99.5,97.5,99.0,150000),
+              (99.0,100.0,98.4,99.6,150000),(99.6,100.8,98.6,99.8,150000),
+              (99.8,100.2,97.6,98.2,150000),(98.2,100.0,97.8,99.0,150000),
+              (99.0,100.3,98.0,99.5,150000),(99.5,100.1,98.2,99.2,150000),
+              (99.2,spike,98.5,99.5,150000),(99.5,100.0,98.6,99.3,150000),
+              (99.3,99.9,98.5,99.4,150000)]
+        return _mkdf(_uptrend(270,60,96)+tail)
+    m1=analyze_vcp(darvas_case(106.0),row,"Daily",0.12,0.05,3,"Strict",0.0,darvas_on=True)
+    m2=analyze_vcp(darvas_case(100.5),row,"Daily",0.12,0.05,3,"Strict",0.0,darvas_on=True)
+    chk("V2 stale (penetrated) Darvas box rejected", m1 is None)
+    chk("V2 intact Darvas box still detected", m2 is not None and m2['base_type']=="DarvasBox")
+    df3=_mkdf(_uptrend(280,60,100)+[(99.5,100.2,99.0,99.8,80000)]*6)
+    df3.loc[len(df3)-4,"high"]=np.nan
+    A=vcp_arrays(df3,tf_params("Daily")); k,piv,_=tight_base(A,A['n']-1,0.05)
+    chk("V1 tight_base stops at a NaN bar", k<=4 and np.isfinite(piv))
+    wdf=_mkdf(_uptrend(45,80,120))
+    _,scanned,failed=run_vcp_screen([dict(symbol="NEWIPO",name="x",exch="NSE")],
+        fetch_fn=lambda r:wdf,timeframe="Weekly",short_history=True,max_workers=1)
+    chk("V4c weekly 45-bar listing is scanned, not failed", "NEWIPO" not in failed)
+    good=_mkdf(_uptrend())
+    def flaky(r):
+        if r["symbol"]=="BAD": raise ValueError("boom")
+        return good
+    try:
+        _,s2,f2=run_vcp_screen([dict(symbol="BAD",name="b",exch="NSE"),
+                                dict(symbol="GOOD",name="g",exch="NSE")],
+                               fetch_fn=flaky,timeframe="Daily",max_workers=1)
+        chk("V4a raising fetch_fn survives (bad symbol -> failed)", s2==1 and f2==["BAD"])
+    except Exception:
+        chk("V4a raising fetch_fn survives (bad symbol -> failed)", False)
+    def authfail(r): raise PermissionError("token expired")
+    try:
+        run_vcp_screen([dict(symbol="X",name="x",exch="NSE")],fetch_fn=authfail,max_workers=1)
+        chk("V4a PermissionError still surfaces to the app", False)
+    except PermissionError:
+        chk("V4a PermissionError still surfaces to the app", True)
+    def ep_case(prerun):
+        lo=80.0; bars=_uptrend(200,70,lo)+_uptrend(70,lo,lo*(1+prerun),vol=90000)
+        p=bars[-1][3]; bars.append((p*1.07,p*1.16,p*1.05,p*1.15,600000))
+        return _mkdf(bars)
+    e1=analyze_vcp(ep_case(0.02),row,"Daily",0.12,0.05,3,"Strict",0.0,ep_on=True)
+    e2=analyze_vcp(ep_case(0.40),row,"Daily",0.12,0.05,3,"Strict",0.0,ep_on=True)
+    chk("V3 EP fires on dormant gap/surge (score path intact)",
+        e1 is not None and e1['base_type']=="EpisodicPivot" and isinstance(e1['score'],(int,float)))
+    chk("EP rejects a stock that already ran +40%", not (e2 and e2['base_type']=="EpisodicPivot"))
+    print(f"\nvcp_core self-test: {'ALL PASS' if not fails else 'FAILURES: '+', '.join(fails)}")
+    return not fails
+
+
 # ----------------------------------------------------------------- test ----
 if __name__=="__main__":
     import sys
+    if "--selftest" in sys.argv:
+        sys.exit(0 if selftest() else 1)
     syms=[("TARIL","Transformers & Rectifiers","NSE"),("RELIANCE","Reliance","NSE"),
           ("BHARTIARTL","Bharti Airtel","NSE"),("SIEMENS","Siemens","NSE"),
           ("ABB","ABB","NSE"),("BEL","BEL","NSE"),("HAL","HAL","NSE"),

@@ -8,6 +8,8 @@ Examples:
   python3 bullish_reversal_screener.py --max 200           # scan first 200 NSE names
   python3 bullish_reversal_screener.py --bse --max 150     # scan BSE
   python3 bullish_reversal_screener.py --both --scan 2     # NSE+BSE, last 2 bars
+  python3 bullish_reversal_screener.py --min-turnover 1    # skip <Rs 1 Cr/day traded
+  python3 bullish_reversal_screener.py --eod-only          # completed candles only
 Data source: Yahoo by default. To use Dhan, set DHAN_ACCESS_TOKEN (and optionally
 DHAN_CLIENT_ID) in your environment — the runner then maps symbols to Dhan security
 IDs automatically.
@@ -45,6 +47,10 @@ def main():
     ap.add_argument("--scan", type=int, default=1)
     ap.add_argument("--weekly", action="store_true", help="use weekly candles instead of daily")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--min-turnover", type=float, default=0.0, dest="min_turnover",
+                    help="skip symbols whose avg traded value per bar is below this many Rs crore (0=off)")
+    ap.add_argument("--eod-only", action="store_true",
+                    help="drop the still-forming last bar (today / current week) so only completed candles signal")
     a = ap.parse_args()
 
     if a.selftest:
@@ -86,10 +92,15 @@ def main():
     def prog(d, t, s):
         done["n"] = d
         if d % 20 == 0 or d == t: print(f"  {d}/{t}", file=sys.stderr)
+    if a.eod_only:
+        base_fetch = fetch_fn
+        fetch_fn = lambda row: sc.drop_partial_last(base_fetch(row), interval)
+        print("EOD-only: dropping the still-forming last bar.", file=sys.stderr)
     print(f"Screening {len(rows)} symbols ({tf} candles)...", file=sys.stderr)
     results, scanned, failed = sc.run_screen(rows, fetch_fn=fetch_fn, scan_last_n=a.scan,
                                              max_workers=eff_workers, progress=prog,
-                                             request_delay=req_delay)
+                                             request_delay=req_delay,
+                                             min_turnover_cr=a.min_turnover)
     html = sc.build_html(results, scanned, failed, a.scan, timeframe=tf)
     open("bullish_screener_report.html", "w").write(html)
     total = sum(len(v) for v in results.values())
